@@ -38,6 +38,15 @@ struct IndexHNSW : Index {
     bool own_fields = false;
     Index* storage = nullptr;
 
+    /** Mean distance from each node to its valid level-0 graph neighbors.
+     *
+     * Values use the storage index's native metric. For METRIC_L2 this is
+     * squared L2 distance. This derived feature is intentionally not part of
+     * the Faiss index serialization format; callers that need it after
+     * loading an index should persist it as a sidecar file.
+     */
+    std::vector<float> level0_avg_neighbor_distance;
+
     // When set to false, level 0 in the knn graph is not initialized.
     // This option is used by GpuIndexCagra::copyTo(IndexHNSWCagra*)
     // as level 0 knn graph is copied over from the index built by
@@ -68,6 +77,13 @@ struct IndexHNSW : Index {
 
     /// Trains the storage if needed
     void train(idx_t n, const float* x) override;
+
+    /** Compute level0_avg_neighbor_distance from the finalized graph.
+     *
+     * Call this after add() has finished. Nodes without a valid level-0
+     * neighbor receive 0.0f.
+     */
+    void compute_level0_avg_neighbor_distance();
 
     /// entry point for search
     void search(

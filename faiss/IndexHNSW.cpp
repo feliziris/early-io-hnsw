@@ -711,6 +711,59 @@ void IndexHNSW::add(idx_t n, const float* x) {
     } else {
         hnsw_add_vertices(*this, n0, n, x, verbose, preset_levels);
     }
+
+    // Any previously computed feature is stale after the graph changes.
+    level0_avg_neighbor_distance.clear();
+}
+
+void IndexHNSW::compute_level0_avg_neighbor_distance() {
+    FAISS_THROW_IF_NOT_MSG(
+            storage,
+            "No storage index, please use IndexHNSWFlat (or variants) "
+            "instead of IndexHNSW directly");
+
+    level0_avg_neighbor_distance.resize(ntotal);
+    std::exception_ptr ex;
+    std::atomic<bool> interrupt{false};
+
+#pragma omp parallel
+    {
+        std::unique_ptr<DistanceComputer> dis;
+        try {
+            dis.reset(storage_distance_computer(storage));
+        } catch (...) {
+            omp_capture_exception(ex, [&] { interrupt = true; });
+        }
+
+#pragma omp for schedule(static)
+        for (idx_t node = 0; node < ntotal; ++node) {
+            if (interrupt.load(std::memory_order_relaxed)) {
+                continue;
+            }
+            try {
+                size_t begin, end;
+                hnsw.neighbor_range(node, 0, &begin, &end);
+
+                double sum = 0.0;
+                size_t count = 0;
+                for (size_t offset = begin; offset < end; ++offset) {
+                    const HNSW::storage_idx_t neighbor =
+                            hnsw.neighbors[offset];
+                    if (neighbor < 0) {
+                        break;
+                    }
+                    sum += dis->symmetric_dis(node, neighbor);
+                    ++count;
+                }
+                level0_avg_neighbor_distance[node] =
+                        count == 0 ? 0.0f
+                                   : static_cast<float>(sum / count);
+            } catch (...) {
+                omp_capture_exception(ex, [&] { interrupt = true; });
+            }
+        }
+    }
+    omp_rethrow_if_exception(ex);
 }
 
 void IndexHNSW::reset() {
@@ -718,6 +771,7 @@ void IndexHNSW::reset() {
     locks.clear();
     storage->reset();
     ntotal = 0;
+    level0_avg_neighbor_distance.clear();
 }
 
 void IndexHNSW::reconstruct(idx_t key, float* recons) const {
