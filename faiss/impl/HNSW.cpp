@@ -7,6 +7,7 @@
 
 #include <faiss/impl/HNSW.h>
 
+#include <algorithm>
 #include <array>
 #include <cinttypes>
 #include <cstddef>
@@ -1116,6 +1117,122 @@ inline void extract_search_params(
     }
 }
 
+template <class C>
+std::vector<size_t> sorted_result_slots(ResultHandler& res, int k) {
+    auto* heap = dynamic_cast<HeapResultHandler<C>*>(&res);
+    FAISS_THROW_IF_NOT_MSG(
+            heap,
+            "HNSW feature collection requires a heap top-k result handler");
+
+    std::vector<size_t> order;
+    order.reserve(k);
+    for (int slot = 0; slot < k; ++slot) {
+        if (heap->heap_ids[slot] >= 0) {
+            order.push_back(slot);
+        }
+    }
+
+    std::sort(order.begin(), order.end(), [&](size_t a, size_t b) {
+        const float da = heap->heap_dis[a];
+        const float db = heap->heap_dis[b];
+        if (da == db) {
+            return heap->heap_ids[a] < heap->heap_ids[b];
+        }
+        // C::cmp(x, y) means y is better than x. Therefore a is better
+        // than b iff C::cmp(db, da).
+        return C::cmp(db, da);
+    });
+    return order;
+}
+
+inline float stable_ratio(float numerator, float denominator) {
+    constexpr float epsilon = 1e-12f;
+    return (numerator + epsilon) / (denominator + epsilon);
+}
+
+template <class C>
+void collect_feature_timestep(
+        ResultHandler& res,
+        const IndexHNSW& index,
+        HNSWQueryTrace& trace,
+        int32_t expanded_node_id,
+        size_t pop_count,
+        std::vector<int32_t>& previous_rank_ids,
+        std::vector<size_t>& rank_persistence_counts) {
+    std::vector<size_t> order = sorted_result_slots<C>(res, trace.k);
+    if (order.size() < static_cast<size_t>(trace.k)) {
+        return;
+    }
+
+    auto* heap = dynamic_cast<HeapResultHandler<C>*>(&res);
+    FAISS_ASSERT(heap);
+
+    HNSWFeatureTimestep timestep;
+    timestep.expanded_node_id = expanded_node_id;
+    timestep.pop_count = pop_count;
+    timestep.first_distance = heap->heap_dis[order[0]];
+    timestep.search_progress = static_cast<float>(pop_count) /
+            static_cast<float>(trace.ef_search);
+    timestep.node_ids.resize(trace.k);
+    timestep.query_distances.resize(trace.k);
+    timestep.features.resize(trace.k * HNSW_FEATURE_COUNT);
+
+    const float timestep_count =
+            static_cast<float>(trace.timesteps.size() + 1);
+    for (int rank = 0; rank < trace.k; ++rank) {
+        const size_t slot = order[rank];
+        const int32_t node_id = static_cast<int32_t>(heap->heap_ids[slot]);
+        const float node_distance = heap->heap_dis[slot];
+
+        if (previous_rank_ids[rank] == node_id) {
+            ++rank_persistence_counts[rank];
+        } else {
+            previous_rank_ids[rank] = node_id;
+            rank_persistence_counts[rank] = 1;
+        }
+
+        timestep.node_ids[rank] = node_id;
+        timestep.query_distances[rank] = node_distance;
+
+        float* features = timestep.features.data() +
+                rank * HNSW_FEATURE_COUNT;
+        features[HNSW_FEATURE_RATIO_TO_ENTRY] =
+                stable_ratio(node_distance, trace.entry_distance);
+        features[HNSW_FEATURE_RATIO_TO_FIRST] = stable_ratio(
+                timestep.first_distance, node_distance);
+        features[HNSW_FEATURE_SEARCH_PROGRESS] =
+                timestep.search_progress;
+        features[HNSW_FEATURE_RANK_NORM] = trace.k == 1
+                ? 0.0f
+                : static_cast<float>(rank) /
+                        static_cast<float>(trace.k - 1);
+        features[HNSW_FEATURE_PERSISTENCE_RATE] =
+                static_cast<float>(rank_persistence_counts[rank]) /
+                timestep_count;
+        features[HNSW_FEATURE_AVG_NEIGH_DIST] =
+                index.level0_avg_neighbor_distance[node_id];
+    }
+
+    trace.timesteps.push_back(std::move(timestep));
+}
+
+template <class C>
+void collect_final_top_k(ResultHandler& res, HNSWQueryTrace& trace) {
+    std::vector<size_t> order = sorted_result_slots<C>(res, trace.k);
+    auto* heap = dynamic_cast<HeapResultHandler<C>*>(&res);
+    FAISS_ASSERT(heap);
+
+    trace.final_top_k_ids.clear();
+    trace.final_top_k_distances.clear();
+    trace.final_top_k_ids.reserve(order.size());
+    trace.final_top_k_distances.reserve(order.size());
+    for (size_t slot : order) {
+        trace.final_top_k_ids.push_back(
+                static_cast<int32_t>(heap->heap_ids[slot]));
+        trace.final_top_k_distances.push_back(heap->heap_dis[slot]);
+    }
+}
+
 /** Templated body of `search_from_candidates` — instantiated once per
  * VisitedTable subclass × comparator.
  */
@@ -1129,7 +1246,9 @@ int search_from_candidates_fixVT(
         HNSWStats& stats,
         int level,
         int nres_in,
-        const SearchParameters* params) {
+        const SearchParameters* params,
+        const IndexHNSW* index = nullptr,
+        HNSWQueryTrace* feature_trace = nullptr) {
     int nres = nres_in;
     int ndis = 0;
 
@@ -1156,6 +1275,16 @@ int search_from_candidates_fixVT(
     }
 
     int nstep = 0;
+    std::vector<int32_t> previous_rank_ids;
+    std::vector<size_t> rank_persistence_counts;
+    if (feature_trace) {
+        FAISS_THROW_IF_NOT_MSG(
+                level == 0 && index,
+                "HNSW feature collection is only available for IndexHNSW "
+                "level-0 search");
+        previous_rank_ids.assign(feature_trace->k, -1);
+        rank_persistence_counts.assign(feature_trace->k, 0);
+    }
 
     while (candidates.size() > 0) {
         float d0 = 0;
@@ -1241,6 +1370,16 @@ int search_from_candidates_fixVT(
         }
 
         nstep++;
+        if (feature_trace) {
+            collect_feature_timestep<C>(
+                    res,
+                    *index,
+                    *feature_trace,
+                    v0,
+                    nstep,
+                    previous_rank_ids,
+                    rank_persistence_counts);
+        }
         if (!do_dis_check && nstep > efSearch) {
             break;
         }
@@ -1270,7 +1409,9 @@ int search_from_candidates_dispatch(
         HNSWStats& stats,
         int level,
         int nres_in,
-        const SearchParameters* params) {
+        const SearchParameters* params,
+        const IndexHNSW* index = nullptr,
+        HNSWQueryTrace* feature_trace = nullptr) {
     auto call = [&]<typename VTType>(VTType& vt_concrete) -> int {
         return search_from_candidates_fixVT<VTType, C>(
                 hnsw,
@@ -1281,7 +1422,9 @@ int search_from_candidates_dispatch(
                 stats,
                 level,
                 nres_in,
-                params);
+                params,
+                index,
+                feature_trace);
     };
     if (VisitedTableVector* vtv = dynamic_cast<VisitedTableVector*>(&vt)) {
         return call(*vtv);
@@ -1688,7 +1831,8 @@ HNSWStats search_impl(
         const IndexHNSW* index,
         ResultHandler& res,
         VisitedTable& vt,
-        const SearchParameters* params) {
+        const SearchParameters* params,
+        HNSWQueryTrace* feature_trace) {
     HNSWStats stats;
     if (hnsw.entry_point == -1) {
         return stats;
@@ -1715,6 +1859,24 @@ HNSWStats search_impl(
         stats.combine(local_stats);
     }
 
+    if (feature_trace) {
+        FAISS_THROW_IF_NOT_MSG(
+                index,
+                "HNSW feature collection requires an IndexHNSW instance");
+        FAISS_THROW_IF_NOT_MSG(
+                bounded_queue,
+                "HNSW feature collection requires bounded_queue=true");
+        FAISS_THROW_IF_NOT_MSG(
+                !hnsw.is_panorama,
+                "HNSW feature collection does not support Panorama search");
+        feature_trace->k = k;
+        feature_trace->ef_search = cur_efSearch;
+        feature_trace->entry_distance = d_nearest;
+        feature_trace->timesteps.clear();
+        feature_trace->final_top_k_ids.clear();
+        feature_trace->final_top_k_distances.clear();
+    }
+
     int ef = std::max(cur_efSearch, k);
     if (bounded_queue) { // this is the most common branch, for now we only
                          // support Panorama search in this branch
@@ -1724,7 +1886,17 @@ HNSWStats search_impl(
 
         if (!hnsw.is_panorama) {
             search_from_candidates_dispatch<C>(
-                    hnsw, qdis, res, candidates, vt, stats, 0, 0, params);
+                    hnsw,
+                    qdis,
+                    res,
+                    candidates,
+                    vt,
+                    stats,
+                    0,
+                    0,
+                    params,
+                    index,
+                    feature_trace);
         } else {
             // Panorama is L2-specific and is only valid for C_distance.
             // The public dispatch ensures we never reach this code path
@@ -1775,6 +1947,10 @@ HNSWStats search_impl(
             res.add_result(d, label);
             top_candidates.pop();
         }
+    }
+
+    if (feature_trace) {
+        collect_final_top_k<C>(res, *feature_trace);
     }
 
     vt.advance();
@@ -1862,10 +2038,22 @@ HNSWStats HNSW::search(
         ResultHandler& res,
         VisitedTable& vt,
         const SearchParameters* params) const {
+    return search(qdis, index, res, vt, params, nullptr);
+}
+
+HNSWStats HNSW::search(
+        DistanceComputer& qdis,
+        const IndexHNSW* index,
+        ResultHandler& res,
+        VisitedTable& vt,
+        const SearchParameters* params,
+        HNSWQueryTrace* feature_trace) const {
     if (is_similarity) {
-        return search_impl<C_similarity>(*this, qdis, index, res, vt, params);
+        return search_impl<C_similarity>(
+                *this, qdis, index, res, vt, params, feature_trace);
     }
-    return search_impl<C_distance>(*this, qdis, index, res, vt, params);
+    return search_impl<C_distance>(
+            *this, qdis, index, res, vt, params, feature_trace);
 }
 
 void HNSW::search_level_0(

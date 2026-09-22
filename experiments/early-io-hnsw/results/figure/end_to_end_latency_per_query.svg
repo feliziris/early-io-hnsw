@@ -1,0 +1,46 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<style>text{font-family:Arial,sans-serif;fill:#111827}.title{font-size:24px;font-weight:700}.subtitle{font-size:13px;fill:#4b5563}.axis{font-size:13px}.value{font-size:12px;font-weight:600}.legend{font-size:13px}</style>
+<text class="title" x="450.0" y="32" text-anchor="middle">End-to-End Latency per Query</text>
+<text class="subtitle" x="450.0" y="54" text-anchor="middle">2,000 test queries · threshold 0.5 · lower is better</text>
+<line x1="100" y1="460.00" x2="860" y2="460.00" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="464.00" text-anchor="end">0</text>
+<line x1="100" y1="412.50" x2="860" y2="412.50" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="416.50" text-anchor="end">50</text>
+<line x1="100" y1="365.00" x2="860" y2="365.00" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="369.00" text-anchor="end">100</text>
+<line x1="100" y1="317.50" x2="860" y2="317.50" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="321.50" text-anchor="end">150</text>
+<line x1="100" y1="270.00" x2="860" y2="270.00" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="274.00" text-anchor="end">200</text>
+<line x1="100" y1="222.50" x2="860" y2="222.50" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="226.50" text-anchor="end">250</text>
+<line x1="100" y1="175.00" x2="860" y2="175.00" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="179.00" text-anchor="end">300</text>
+<line x1="100" y1="127.50" x2="860" y2="127.50" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="131.50" text-anchor="end">350</text>
+<line x1="100" y1="80.00" x2="860" y2="80.00" stroke="#e5e7eb" stroke-width="1"/>
+<text class="axis" x="88" y="84.00" text-anchor="end">400</text>
+<line x1="100" y1="80" x2="100" y2="460" stroke="#374151" stroke-width="1.5"/>
+<line x1="100" y1="460" x2="860" y2="460" stroke="#374151" stroke-width="1.5"/>
+<text class="axis" x="22" y="270.0" text-anchor="middle" transform="rotate(-90 22 270.0)">Latency (ms/query)</text>
+<rect x="139.67" y="303.59" width="78" height="156.41" rx="3" fill="#6b7280"/>
+<text class="value" x="178.67" y="295.59" text-anchor="middle">164.64</text>
+<rect x="235.67" y="289.00" width="78" height="171.00" rx="3" fill="#2563eb"/>
+<text class="value" x="274.67" y="281.00" text-anchor="middle">180.00</text>
+<text class="axis" x="226.67" y="488" text-anchor="middle">k=10</text>
+<rect x="393.00" y="254.12" width="78" height="205.88" rx="3" fill="#6b7280"/>
+<text class="value" x="432.00" y="246.12" text-anchor="middle">216.72</text>
+<rect x="489.00" y="228.93" width="78" height="231.07" rx="3" fill="#2563eb"/>
+<text class="value" x="528.00" y="220.93" text-anchor="middle">243.23</text>
+<text class="axis" x="480.00" y="488" text-anchor="middle">k=20</text>
+<rect x="646.33" y="128.48" width="78" height="331.52" rx="3" fill="#6b7280"/>
+<text class="value" x="685.33" y="120.48" text-anchor="middle">348.97</text>
+<rect x="742.33" y="118.04" width="78" height="341.96" rx="3" fill="#2563eb"/>
+<text class="value" x="781.33" y="110.04" text-anchor="middle">359.96</text>
+<text class="axis" x="733.33" y="488" text-anchor="middle">k=50</text>
+<rect x="320.00" y="519" width="18" height="18" rx="2" fill="#6b7280"/>
+<text class="legend" x="347.00" y="533">Baseline</text>
+<rect x="470.00" y="519" width="18" height="18" rx="2" fill="#2563eb"/>
+<text class="legend" x="497.00" y="533">Prefetch</text>
+</svg>

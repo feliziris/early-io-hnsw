@@ -130,6 +130,40 @@ void write_mapping(
     }
 }
 
+void write_level0_avg_neighbor_distance(
+        const std::string& path,
+        const faiss::IndexHNSW& index) {
+    if (index.level0_avg_neighbor_distance.size() !=
+        static_cast<std::size_t>(index.ntotal)) {
+        throw std::runtime_error(
+                "level-0 average neighbor distances have not been computed");
+    }
+
+    std::ofstream output(path);
+    if (!output) {
+        throw std::runtime_error("cannot open feature output: " + path);
+    }
+    output << "internal_id\tavg_neighbor_distance\tneighbor_count\n";
+    output << std::setprecision(9);
+    for (faiss::idx_t node = 0; node < index.ntotal; ++node) {
+        std::size_t begin, end;
+        index.hnsw.neighbor_range(node, 0, &begin, &end);
+        std::size_t neighbor_count = 0;
+        for (std::size_t offset = begin; offset < end; ++offset) {
+            if (index.hnsw.neighbors[offset] < 0) {
+                break;
+            }
+            ++neighbor_count;
+        }
+        output << node << '\t'
+               << index.level0_avg_neighbor_distance[node] << '\t'
+               << neighbor_count << '\n';
+    }
+    if (!output) {
+        throw std::runtime_error("failed writing feature output: " + path);
+    }
+}
+
 double elapsed_seconds(const std::chrono::steady_clock::time_point start) {
     return std::chrono::duration<double>(
                    std::chrono::steady_clock::now() - start)
@@ -139,15 +173,17 @@ double elapsed_seconds(const std::chrono::steady_clock::time_point start) {
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 4) {
+    if (argc != 5) {
         std::cerr << "usage: " << argv[0]
-                  << " <sift_base.fvecs> <output.index> <mapping.tsv>\n";
+                  << " <sift_base.fvecs> <output.index> <mapping.tsv> "
+                     "<avg-neighbor-distance.tsv>\n";
         return 2;
     }
 
     const std::string input_path = argv[1];
     const std::string index_path = argv[2];
     const std::string mapping_path = argv[3];
+    const std::string feature_path = argv[4];
 
     try {
         std::ifstream input(input_path, std::ios::binary);
@@ -194,11 +230,18 @@ int main(int argc, char** argv) {
                   << " entry_point=" << index.hnsw.entry_point << '\n';
 
         started = std::chrono::steady_clock::now();
+        index.compute_level0_avg_neighbor_distance();
+        std::cout << "avg_neighbor_distance_seconds="
+                  << elapsed_seconds(started) << '\n';
+
+        started = std::chrono::steady_clock::now();
         faiss::write_index(&index, index_path.c_str());
         write_mapping(mapping_path, original_ids);
+        write_level0_avg_neighbor_distance(feature_path, index);
         std::cout << "write_seconds=" << elapsed_seconds(started) << '\n';
         std::cout << "index_path=" << index_path << '\n';
         std::cout << "mapping_path=" << mapping_path << '\n';
+        std::cout << "feature_path=" << feature_path << '\n';
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

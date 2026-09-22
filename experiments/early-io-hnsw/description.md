@@ -50,6 +50,42 @@ SIFT1M의 base 벡터 1,000,000개 중 100,000개를 고정 seed로 중복 없�
 그래프를 만들기 위한 구축 옵션이며 검색 정확도를 조절하는 값은 아니다.
 `efSearch=200`은 직렬화된 인덱스에 저장되며 검색 시 덮어쓸 수 있다.
 
+## Level-0 평균 이웃 거리 피처
+
+최종 그래프 구축 후 `IndexHNSW::compute_level0_avg_neighbor_distance()`를
+호출한다. 각 노드의 유효한 level-0 이웃만 대상으로 native metric 거리의
+산술평균을 계산한다. 현재 L2 인덱스에서 이 값은 squared L2 distance다.
+
+계산값은 `IndexHNSW::level0_avg_neighbor_distance` 벡터에서 내부 ID로
+조회한다. 기존 FAISS 인덱스 직렬화 호환성을 유지하기 위해 인덱스 파일에는
+넣지 않고 별도 TSV sidecar로 저장한다.
+
+## 검색 중 동적 피처 수집
+
+`SearchParametersHNSW::feature_collector`에 `HNSWFeatureCollector`를
+지정하면 level-0 검색에서 노드 하나를 pop하여 이웃을 모두 평가하고
+`res` heap을 갱신한 직후마다 현재 best-so-far top-k를 수집한다. 원본 heap은
+변경하지 않고 유효한 heap slot 번호만 거리와 ID 순서로 정렬한다.
+
+각 timestep은 확장한 노드 ID, pop 횟수, top-k 내부 ID와 query 거리, 그리고
+rank-major 형태의 `k * 6` 피처를 저장한다. slot별 순서는 다음과 같다.
+
+```text
+ratio_to_entry, ratio_to_first, search_progress,
+rank_norm, persistence_rate, avg_neigh_dist
+```
+
+- `ratio_to_entry = d_node / d_entry`
+- `ratio_to_first = d_first / d_node`
+- `search_progress = pop_count / efSearch` (clamp하지 않음)
+- `rank_norm = rank / (k - 1)`
+- `persistence_rate`: 같은 노드가 동일 rank를 연속 유지한 횟수 / timestep 수
+- `avg_neigh_dist`: 사전 계산한 level-0 평균 이웃 거리
+
+검색 종료 시 최종 top-k ID와 거리도 query trace에 저장한다. 현재 collector는
+`METRIC_L2`, `bounded_queue=true`, non-Panorama 검색을 지원하며 결과는
+메모리에 유지한다. 디스크 직렬화 형식은 아직 추가하지 않았다.
+
 ## 코드와 실행 방법
 
 - 구축 소스: `demos/build_sift100k_hnsw.cpp`
@@ -79,19 +115,24 @@ mkdir -p output
 ./build-cpu/demos/build_sift100k_hnsw \
   /path/to/sift_base.fvecs \
   output/sift100k_hnsw_m32_efc200_efs200.index \
-  output/sift100k_internal_to_original.tsv
+  output/sift100k_internal_to_original.tsv \
+  output/sift100k_level0_avg_neighbor_distance.tsv
 ```
 
 ## 실제 구축 결과
 
-- 샘플링 시간: 0.414초
-- HNSW 구축 시간: 11.061초
-- 파일 기록 시간: 0.118초
+- 샘플링 시간: 0.360초
+- HNSW 구축 시간: 8.848초
+- level-0 평균 이웃 거리 계산 시간: 0.080초
+- 파일 기록 시간: 0.293초
 - `ntotal`: 100,000
 - `max_level`: 3
 - `entry_point`: 20,288
 - 인덱스 크기: 약 75 MiB
 - 매핑 크기: 약 1.3 MiB
+- 평균 이웃 거리 sidecar 크기: 약 1.9 MiB
+- level-0 이웃 수: 최소 2개, 최대 64개, 평균 27.20789개
+- 고립 노드 수: 0개
 
 매핑 파일은 헤더를 제외하고 정확히 100,000행이며 다음을 검증했다.
 

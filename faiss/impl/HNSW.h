@@ -7,6 +7,8 @@
 
 #pragma once
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <optional>
 #include <queue>
@@ -52,10 +54,57 @@ struct VisitedTable;
 struct DistanceComputer; // from AuxIndexStructures
 struct HNSWStats;
 
+/** Per-timestep HNSW features, stored in rank-major order.
+ *
+ * node_ids[r] and query_distances[r] describe rank r in the current result
+ * heap. features[r * HNSW_FEATURE_COUNT + f] stores feature f for that node.
+ */
+constexpr size_t HNSW_FEATURE_COUNT = 6;
+
+enum HNSWFeatureIndex : size_t {
+    HNSW_FEATURE_RATIO_TO_ENTRY = 0,
+    HNSW_FEATURE_RATIO_TO_FIRST = 1,
+    HNSW_FEATURE_SEARCH_PROGRESS = 2,
+    HNSW_FEATURE_RANK_NORM = 3,
+    HNSW_FEATURE_PERSISTENCE_RATE = 4,
+    HNSW_FEATURE_AVG_NEIGH_DIST = 5,
+};
+
+struct HNSWFeatureTimestep {
+    int32_t expanded_node_id = -1;
+    size_t pop_count = 0;
+    float first_distance = 0.0f;
+    float search_progress = 0.0f;
+    std::vector<int32_t> node_ids;
+    std::vector<float> query_distances;
+    std::vector<float> features;
+};
+
+struct HNSWQueryTrace {
+    int64_t query_id = -1;
+    int k = 0;
+    int ef_search = 0;
+    float entry_distance = 0.0f;
+    std::vector<HNSWFeatureTimestep> timesteps;
+    std::vector<int32_t> final_top_k_ids;
+    std::vector<float> final_top_k_distances;
+};
+
+/** Output container for optional HNSW runtime feature collection.
+ *
+ * A collector belongs to one IndexHNSW::search() invocation and must not be
+ * shared by concurrent search calls. Queries within one batch are safe: each
+ * OpenMP worker writes to a different element of queries.
+ */
+struct HNSWFeatureCollector {
+    std::vector<HNSWQueryTrace> queries;
+};
+
 struct SearchParametersHNSW : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
     bool bounded_queue = true;
+    HNSWFeatureCollector* feature_collector = nullptr;
 
     ~SearchParametersHNSW() {}
 };
@@ -251,6 +300,15 @@ struct HNSW {
             ResultHandler& res,
             VisitedTable& vt,
             const SearchParameters* params = nullptr) const;
+
+    /// Search while collecting per-timestep result-heap features.
+    HNSWStats search(
+            DistanceComputer& qdis,
+            const IndexHNSW* index,
+            ResultHandler& res,
+            VisitedTable& vt,
+            const SearchParameters* params,
+            HNSWQueryTrace* feature_trace) const;
 
     /// search only in level 0 from a given vertex
     void search_level_0(

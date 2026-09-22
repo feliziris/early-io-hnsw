@@ -570,11 +570,30 @@ void hnsw_search(
     const HNSW& hnsw = index->hnsw;
 
     int efSearch = hnsw.efSearch;
+    HNSWFeatureCollector* feature_collector = nullptr;
     if (params) {
         if (const SearchParametersHNSW* hnsw_params =
                     dynamic_cast<const SearchParametersHNSW*>(params)) {
             efSearch = hnsw_params->efSearch;
+            feature_collector = hnsw_params->feature_collector;
         }
+    }
+
+    if (feature_collector) {
+        FAISS_THROW_IF_NOT_MSG(
+                efSearch > 0,
+                "HNSW feature collection requires efSearch > 0");
+        FAISS_THROW_IF_NOT_MSG(
+                index->metric_type == METRIC_L2,
+                "HNSW feature collection currently supports METRIC_L2 only");
+        FAISS_THROW_IF_NOT_MSG(
+                index->level0_avg_neighbor_distance.size() ==
+                        static_cast<size_t>(index->ntotal),
+                "level-0 average neighbor distances are unavailable; call "
+                "compute_level0_avg_neighbor_distance() after building or "
+                "loading the index");
+        feature_collector->queries.clear();
+        feature_collector->queries.resize(n);
     }
     size_t n1 = 0, n2 = 0, ndis = 0, nhops = 0;
 
@@ -611,8 +630,19 @@ void hnsw_search(
                     res->begin(i);
                     dis->set_query(x + i * index->d);
 
-                    HNSWStats stats =
-                            hnsw.search(*dis, index, *res, *vt, params);
+                    HNSWQueryTrace* feature_trace = nullptr;
+                    if (feature_collector) {
+                        feature_trace = &feature_collector->queries[i];
+                        feature_trace->query_id = i;
+                    }
+
+                    HNSWStats stats = hnsw.search(
+                            *dis,
+                            index,
+                            *res,
+                            *vt,
+                            params,
+                            feature_trace);
                     n1 += stats.n1;
                     n2 += stats.n2;
                     ndis += stats.ndis;
