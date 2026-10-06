@@ -33,6 +33,8 @@ template <class HC_>
 struct MinimaxHeapT;
 using MinimaxHeap = MinimaxHeapT<CMax<float, int32_t>>;
 class LockVector;
+class HNSWOnnxModel;
+class HNSWRawDataPrefetcher;
 
 /** Implementation of the Hierarchical Navigable Small World
  * datastructure.
@@ -78,6 +80,8 @@ struct HNSWFeatureTimestep {
     std::vector<int32_t> node_ids;
     std::vector<float> query_distances;
     std::vector<float> features;
+    std::vector<float> prediction_probabilities;
+    std::vector<uint8_t> prefetch_decisions;
 };
 
 struct HNSWQueryTrace {
@@ -105,6 +109,28 @@ struct SearchParametersHNSW : SearchParameters {
     bool check_relative_distance = true;
     bool bounded_queue = true;
     HNSWFeatureCollector* feature_collector = nullptr;
+    /// Optional streaming LSTM. A null model disables online prediction.
+    /// The caller owns this model and must keep it alive through search().
+    HNSWOnnxModel* onnx_model = nullptr;
+    float onnx_threshold = 0.5f;
+    /// Optional raw-payload reader. A query waits until its final top-k
+    /// payloads are resident/read before search() returns.
+    /// The caller owns this object and must keep it alive through search().
+    HNSWRawDataPrefetcher* raw_data_prefetcher = nullptr;
+    bool prefetch_enabled = false;
+    /** ORACLE EVALUATION ONLY.
+     *
+     * When enabled, model inference and threshold decisions still run, but a
+     * predicted node is submitted for I/O only if it belongs to the known
+     * final top-k supplied below. This is not deployable online behavior; it
+     * exists solely to measure the latency cost caused by false-positive I/O.
+     * `oracle_final_ids` contains `oracle_query_count * oracle_k` row-major
+     * IDs for the current search() call.
+     */
+    bool oracle_prefetch = false;
+    const idx_t* oracle_final_ids = nullptr;
+    size_t oracle_query_count = 0;
+    size_t oracle_k = 0;
 
     ~SearchParametersHNSW() {}
 };

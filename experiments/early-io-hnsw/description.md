@@ -86,6 +86,145 @@ rank_norm, persistence_rate, avg_neigh_dist
 `METRIC_L2`, `bounded_queue=true`, non-Panorama 검색을 지원하며 결과는
 메모리에 유지한다. 디스크 직렬화 형식은 아직 추가하지 않았다.
 
+## 검색 루프 내부 ONNX LSTM 추론
+
+`FAISS_ENABLE_ONNX_RUNTIME=ON`으로 빌드하면 `HNSWOnnxModel`을 통해
+stateful ONNX LSTM을 로드할 수 있다. `SearchParametersHNSW::onnx_model`에
+모델을 지정하고 `onnx_threshold`를 설정하면 level-0 결과 큐가 갱신된 매
+timestep마다 6개 피처로 추론한다. hidden/cell state는 query마다 0으로
+초기화되고 query 내부에서만 다음 timestep으로 전달된다. batch/OpenMP 검색
+시에도 query state는 서로 공유하지 않는다.
+
+```cpp
+faiss::SearchParametersHNSW params;
+params.efSearch = 200;
+faiss::HNSWOnnxModel model(model_path);
+params.onnx_model = &model;
+params.onnx_threshold = 0.5f;
+```
+
+모델을 지정하지 않으면 ONNX 추론을 전혀 실행하지 않아 기존 baseline 검색
+경로를 유지한다. `HNSWFeatureTimestep::prediction_probabilities`와
+`prefetch_decisions`에서 timestep별 결과를 검사할 수 있다.
+
+## 검색 루프 내부 raw payload prefetch
+
+`HNSWRawDataPrefetcher`는 raw 파일을 한 번 `mmap`하고 bounded queue와 worker
+thread로 개별 512 KiB payload를 읽는다. `prefetch_enabled=true`이면 매
+timestep의 ONNX 결정 직후 해당 내부 node ID를 제출하며, 같은 query에서 이미
+제출한 node는 다시 제출하지 않는다. 검색 종료 시 최종 top-k 중 제출한 요청은
+완료를 기다리고, 놓친 node만 검색 thread에서 동기 읽는다.
+
+`prefetch_enabled=false`인 baseline은 ONNX 추론이나 early 제출은 수행하지
+않지만, 검색 종료 후 최종 top-k payload를 동일한 worker queue에 한꺼번에
+제출한다. prefetch가 놓친 최종 node도 검색 종료 후 같은 방식으로 제출한다.
+따라서 baseline과 prefetch는 같은 worker 수와 I/O 병렬성을 사용하며, 차이는
+읽기 요청을 검색 종료 후 제출하는지 검색 도중 미리 제출하는지다. 두 모드의
+end-to-end 경계는 모두 "HNSW 검색 시작부터 최종 top-k payload 준비 완료"다.
+
+```cpp
+faiss::HNSWRawDataPrefetcher payloads(
+        raw_path, 512 * 1024, 4, 4096, false);
+params.raw_data_prefetcher = &payloads;
+params.prefetch_enabled = true;
+```
+
+실행 예시는 다음과 같다. `--evict-file-cache`는 실행 직전 해당 raw 파일에
+`POSIX_FADV_DONTNEED` 힌트를 적용한다.
+
+```bash
+# baseline
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX QUERY TRACE TRACE_INDEX 10 200 10 \
+  --prefetch off --raw-data payload512k.bin \
+  --payload-size 524288 --io-workers 4 --io-queue-size 4096
+
+# ONNX + asynchronous prefetch
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX QUERY TRACE TRACE_INDEX 10 200 10 \
+  --onnx-model model.onnx --threshold 0.5 \
+  --prefetch on --raw-data payload512k.bin \
+  --payload-size 524288 --io-workers 4 --io-queue-size 4096
+
+# ORACLE EVALUATION ONLY: 모델의 FP I/O를 제거한 비교군
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX QUERY TRACE TRACE_INDEX 10 200 10 \
+  --onnx-model model.onnx --threshold 0.5 \
+  --prefetch on --oracle-prefetch --raw-data payload512k.bin \
+  --payload-size 524288 --io-workers 4 --io-queue-size 4096
+```
+
+`--oracle-prefetch`는 실제 시스템에 배포할 수 있는 정책이 아니라 FP I/O의
+영향을 분리하기 위한 평가 전용 모드다. 프로그램은 먼저 ONNX와 raw I/O 없이
+동일한 HNSW 파라미터로 모든 query의 최종 top-k를 계산한다. 이 시간은
+`oracle_precompute_seconds`로 별도 출력되며 아래의 query latency에는 포함되지
+않는다. 측정 검색에서는 기존 모델 추론과 threshold 판단을 그대로 수행하되,
+미리 계산한 최종 top-k에 속하지 않는 예측 node의 I/O 제출만 차단한다.
+검색 traversal, 결과 queue, trace 및 모델 출력은 일반 prefetch와 동일하다.
+
+같은 cache 조건에서 일반 prefetch와 oracle을 짝지어 실행했을 때
+`raw_data_ready_wait` 차이는 FP 요청의 queue 및 저장장치 경합이 최종 결과 준비를
+지연시킨 정도를 근사한다. I/O가 서로 겹쳐 실행되므로 TP와 FP의 지연시간을
+개별 요청 시간처럼 단순 합산해서 정확히 분해할 수는 없다.
+
+출력에는 query별 `search`, `data_ready_wait`, `end_to_end` latency 분포와
+비동기 queue wait, 실제 mmap read, decision-to-completion latency가 포함된다.
+`wasted_io_ratio`는 중복 제거된 node 기준으로
+`prefetch_fp / (prefetch_tp + prefetch_fn)`이다.
+
+전체 query를 batch size 1로 baseline과 prefetch 순서로 반복 실행하려면 다음
+스크립트를 사용한다. 기본값은 1회 반복, k=10, batch size=1, threshold=0.5다.
+기본 query 입력은 HDF5의 seed-42 `test_query_ids`로 추출한 2,000개 test
+query인 `output/sift_query_test_seed42.fvecs`다.
+
+최초 한 번 test query 파일과 원본 query ID 매핑을 생성한다.
+
+```bash
+python experiments/early-io-hnsw/python/extract_test_queries.py \
+  --source ../data/sift/sift_query.fvecs \
+  --hdf5 ../output/sift_query10000_k10.h5 \
+  --output ../output/sift_query_test_seed42.fvecs \
+  --mapping ../output/sift_query_test_seed42_mapping.tsv
+```
+
+```bash
+./experiments/early-io-hnsw/run_hnsw_prefetch_benchmark.sh
+
+# repetitions, top-k, batch-size, threshold
+./experiments/early-io-hnsw/run_hnsw_prefetch_benchmark.sh 5 20 1 0.6
+```
+
+각 실행에 `--evict-file-cache`가 적용되며 로그, 설정, 요약 TSV는
+`workspace/results/hnsw_live_prefetch/<실행 시각>/`에 저장된다. trace 파일은
+측정 중 임시 디렉터리에 기록되고 실행 종료 시 제거된다.
+
+k=10, 20, 50을 차례로 모두 실행하려면 다음 wrapper를 사용한다.
+
+```bash
+./experiments/early-io-hnsw/run_all_hnsw_prefetch_benchmarks.sh
+```
+
+ONNX Runtime 개발 헤더와 라이브러리 위치를 명시해 빌드한다.
+
+```bash
+cmake -S . -B build-onnx \
+  -DFAISS_ENABLE_GPU=OFF \
+  -DFAISS_ENABLE_PYTHON=OFF \
+  -DFAISS_ENABLE_ONNX_RUNTIME=ON \
+  -DONNXRUNTIME_INCLUDE_DIR=/path/to/onnxruntime/include \
+  -DONNXRUNTIME_LIBRARY=/path/to/libonnxruntime.so
+cmake --build build-onnx --target generate_sift_query_labels -j2
+```
+
+`generate_sift_query_labels`의 기존 인자 뒤에 모델 경로와 threshold를
+선택적으로 전달할 수 있다.
+
+```bash
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX QUERY TRACE TRACE_INDEX 10 200 10 \
+  --onnx-model MODEL_ONNX --threshold 0.5
+```
+
 ## 코드와 실행 방법
 
 - 구축 소스: `demos/build_sift100k_hnsw.cpp`

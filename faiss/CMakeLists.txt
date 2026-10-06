@@ -156,6 +156,8 @@ set(FAISS_SRC
   impl/IDSelector.cpp
   impl/FaissException.cpp
   impl/HNSW.cpp
+  impl/HNSWOnnxInference.cpp
+  impl/HNSWRawDataPrefetch.cpp
   impl/hnsw/LockVector.cpp
   impl/hnsw/MinimaxHeap.cpp
   impl/result_handler/ResultHandler.cpp
@@ -296,6 +298,8 @@ set(FAISS_HEADERS
   impl/FaissAssert.h
   impl/FaissException.h
   impl/HNSW.h
+  impl/HNSWOnnxInference.h
+  impl/HNSWRawDataPrefetch.h
   impl/hnsw/LockVector.h
   impl/hnsw/MinimaxHeap.h
   impl/LocalSearchQuantizer.h
@@ -662,6 +666,17 @@ set_target_properties(faiss faiss_avx2 faiss_avx512 faiss_avx512_spr faiss_sve P
   POSITION_INDEPENDENT_CODE ON
   WINDOWS_EXPORT_ALL_SYMBOLS ON
 )
+
+if(FAISS_ENABLE_ONNX_RUNTIME)
+  get_filename_component(_ONNXRUNTIME_LIBRARY_DIR "${ONNXRUNTIME_LIBRARY}" DIRECTORY)
+  foreach(_faiss_target faiss faiss_avx2 faiss_avx512 faiss_avx512_spr faiss_sve)
+    target_compile_definitions(${_faiss_target} PRIVATE FAISS_ENABLE_ONNX_RUNTIME)
+    target_include_directories(${_faiss_target} PRIVATE "${ONNXRUNTIME_INCLUDE_DIR}")
+    target_link_libraries(${_faiss_target} PUBLIC "${ONNXRUNTIME_LIBRARY}")
+    set_property(TARGET ${_faiss_target} APPEND PROPERTY BUILD_RPATH
+      "${_ONNXRUNTIME_LIBRARY_DIR}")
+  endforeach()
+endif()
 
 if(WIN32)
   target_compile_definitions(faiss PRIVATE FAISS_MAIN_LIB)

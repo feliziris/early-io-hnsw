@@ -94,6 +94,9 @@ option(FAISS_ENABLE_MKL "Enable MKL." ON)
 option(FAISS_ENABLE_PYTHON "Build Python extension." ON)
 option(FAISS_ENABLE_C_API "Build C API." OFF)
 option(FAISS_ENABLE_EXTRAS "Build extras like benchmarks and demos" ON)
+option(FAISS_ENABLE_ONNX_RUNTIME "Enable ONNX Runtime for HNSW inference" OFF)
+set(ONNXRUNTIME_INCLUDE_DIR "" CACHE PATH "Directory containing onnxruntime_cxx_api.h")
+set(ONNXRUNTIME_LIBRARY "" CACHE FILEPATH "Path to the ONNX Runtime library")
 option(FAISS_USE_LTO "Enable Link-Time optimization" OFF)
 if(APPLE AND CMAKE_SYSTEM_PROCESSOR STREQUAL "arm64")
   set(_FAISS_METAL_DEFAULT ON)
@@ -105,6 +108,17 @@ option(FAISS_ENABLE_METAL "Enable Metal GPU backend for Apple Silicon."
 option(FAISS_ENABLE_SVS "Enable SVS (Intel(R) Scalable Vector Search) integration." OFF)
 set(FAISS_SVS_RUNTIME_VERSION "v0" CACHE STRING "Version of the SVS runtime API to use")
 set_property(CACHE FAISS_SVS_RUNTIME_VERSION PROPERTY STRINGS "v0")
+
+if(FAISS_ENABLE_ONNX_RUNTIME)
+  if(NOT EXISTS "${ONNXRUNTIME_INCLUDE_DIR}/onnxruntime_cxx_api.h")
+    message(FATAL_ERROR
+      "FAISS_ENABLE_ONNX_RUNTIME requires ONNXRUNTIME_INCLUDE_DIR containing onnxruntime_cxx_api.h")
+  endif()
+  if(NOT EXISTS "${ONNXRUNTIME_LIBRARY}")
+    message(FATAL_ERROR
+      "FAISS_ENABLE_ONNX_RUNTIME requires ONNXRUNTIME_LIBRARY")
+  endif()
+endif()
 
 if(FAISS_ENABLE_GPU)
   if(FAISS_ENABLE_ROCM)

@@ -13,11 +13,14 @@
 #include <cstddef>
 #include <cstdlib>
 #include <type_traits>
+#include <unordered_set>
 
 #include <faiss/IndexHNSW.h>
 
 #include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/IDSelector.h>
+#include <faiss/impl/HNSWOnnxInference.h>
+#include <faiss/impl/HNSWRawDataPrefetch.h>
 #include <faiss/impl/ResultHandler.h>
 #include <faiss/impl/VisitedTable.h>
 #include <faiss/impl/hnsw/LockVector.h>
@@ -1248,7 +1251,11 @@ int search_from_candidates_fixVT(
         int nres_in,
         const SearchParameters* params,
         const IndexHNSW* index = nullptr,
-        HNSWQueryTrace* feature_trace = nullptr) {
+        HNSWQueryTrace* feature_trace = nullptr,
+        HNSWOnnxQuery* onnx_query = nullptr,
+        float onnx_threshold = 0.5f,
+        HNSWRawDataQuery* raw_data_query = nullptr,
+        const std::unordered_set<int32_t>* oracle_final_ids = nullptr) {
     int nres = nres_in;
     int ndis = 0;
 
@@ -1379,6 +1386,35 @@ int search_from_candidates_fixVT(
                     nstep,
                     previous_rank_ids,
                     rank_persistence_counts);
+            if (onnx_query && !feature_trace->timesteps.empty()) {
+                HNSWFeatureTimestep& timestep =
+                        feature_trace->timesteps.back();
+                timestep.prediction_probabilities = onnx_query->predict(
+                        timestep.features.data(), timestep.features.size());
+                timestep.prefetch_decisions.resize(
+                        timestep.prediction_probabilities.size());
+                for (size_t rank = 0;
+                     rank < timestep.prediction_probabilities.size();
+                     ++rank) {
+                    timestep.prefetch_decisions[rank] =
+                            static_cast<uint8_t>(
+                                    timestep.prediction_probabilities[rank] >=
+                                    onnx_threshold);
+                    if (raw_data_query &&
+                        timestep.prefetch_decisions[rank] &&
+                        timestep.node_ids[rank] >= 0 &&
+                        (!oracle_final_ids ||
+                         oracle_final_ids->count(
+                                 timestep.node_ids[rank]) != 0)) {
+                        // ORACLE EVALUATION ONLY: when oracle_final_ids is
+                        // present, preserve model inference and its threshold
+                        // decisions but suppress I/O for predicted nodes that
+                        // are not members of the known final top-k. This
+                        // isolates the storage-latency cost of false positives.
+                        raw_data_query->submit(timestep.node_ids[rank]);
+                    }
+                }
+            }
         }
         if (!do_dis_check && nstep > efSearch) {
             break;
@@ -1411,7 +1447,11 @@ int search_from_candidates_dispatch(
         int nres_in,
         const SearchParameters* params,
         const IndexHNSW* index = nullptr,
-        HNSWQueryTrace* feature_trace = nullptr) {
+        HNSWQueryTrace* feature_trace = nullptr,
+        HNSWOnnxQuery* onnx_query = nullptr,
+        float onnx_threshold = 0.5f,
+        HNSWRawDataQuery* raw_data_query = nullptr,
+        const std::unordered_set<int32_t>* oracle_final_ids = nullptr) {
     auto call = [&]<typename VTType>(VTType& vt_concrete) -> int {
         return search_from_candidates_fixVT<VTType, C>(
                 hnsw,
@@ -1424,7 +1464,11 @@ int search_from_candidates_dispatch(
                 nres_in,
                 params,
                 index,
-                feature_trace);
+                feature_trace,
+                onnx_query,
+                onnx_threshold,
+                raw_data_query,
+                oracle_final_ids);
     };
     if (VisitedTableVector* vtv = dynamic_cast<VisitedTableVector*>(&vt)) {
         return call(*vtv);
@@ -1841,12 +1885,64 @@ HNSWStats search_impl(
 
     bool bounded_queue = hnsw.search_bounded_queue;
     int cur_efSearch = hnsw.efSearch;
+    HNSWOnnxModel* onnx_model = nullptr;
+    float onnx_threshold = 0.5f;
+    HNSWRawDataPrefetcher* raw_data_prefetcher = nullptr;
+    bool prefetch_enabled = false;
+    bool oracle_prefetch = false;
+    const idx_t* oracle_final_ids = nullptr;
+    size_t oracle_k = 0;
     if (params) {
         if (const SearchParametersHNSW* hnsw_params =
                     dynamic_cast<const SearchParametersHNSW*>(params)) {
             bounded_queue = hnsw_params->bounded_queue;
             cur_efSearch = hnsw_params->efSearch;
+            onnx_model = hnsw_params->onnx_model;
+            onnx_threshold = hnsw_params->onnx_threshold;
+            raw_data_prefetcher = hnsw_params->raw_data_prefetcher;
+            prefetch_enabled = hnsw_params->prefetch_enabled;
+            oracle_prefetch = hnsw_params->oracle_prefetch;
+            oracle_final_ids = hnsw_params->oracle_final_ids;
+            oracle_k = hnsw_params->oracle_k;
         }
+    }
+
+    FAISS_THROW_IF_NOT_MSG(
+            !prefetch_enabled || raw_data_prefetcher,
+            "prefetch_enabled=true requires a raw data prefetcher");
+    FAISS_THROW_IF_NOT_MSG(
+            !prefetch_enabled || onnx_model,
+            "prefetch_enabled=true requires an ONNX model");
+    FAISS_THROW_IF_NOT_MSG(
+            !oracle_prefetch || prefetch_enabled,
+            "oracle prefetch requires prefetch_enabled=true");
+    FAISS_THROW_IF_NOT_MSG(
+            !oracle_prefetch || oracle_final_ids,
+            "oracle prefetch requires final top-k IDs");
+    FAISS_THROW_IF_NOT_FMT(
+            !oracle_prefetch || oracle_k == static_cast<size_t>(k),
+            "oracle top-k %zu does not match search k %d",
+            oracle_k,
+            k);
+
+    std::unordered_set<int32_t> oracle_final_set;
+    if (oracle_prefetch) {
+        // ORACLE EVALUATION ONLY: materialize the known final result as an
+        // O(1)-membership filter for I/O submission. This set must never be
+        // used to alter HNSW traversal, result insertion, or model inference.
+        oracle_final_set.reserve(oracle_k);
+        for (size_t rank = 0; rank < oracle_k; ++rank) {
+            FAISS_THROW_IF_NOT_MSG(
+                    oracle_final_ids[rank] >= 0,
+                    "oracle final top-k contains an invalid node ID");
+            oracle_final_set.insert(
+                    static_cast<int32_t>(oracle_final_ids[rank]));
+        }
+    }
+    std::unique_ptr<HNSWRawDataQuery> raw_data_query;
+    if (raw_data_prefetcher) {
+        raw_data_query =
+                raw_data_prefetcher->create_query(prefetch_enabled);
     }
 
     //  greedy search on upper levels
@@ -1857,6 +1953,40 @@ HNSWStats search_impl(
         HNSWStats local_stats = greedy_update_nearest_impl<C>(
                 hnsw, qdis, level, nearest, d_nearest);
         stats.combine(local_stats);
+    }
+
+    HNSWQueryTrace onnx_only_trace;
+    std::unique_ptr<HNSWOnnxQuery> onnx_query;
+    if (onnx_model) {
+        FAISS_THROW_IF_NOT_MSG(
+                index,
+                "HNSW ONNX inference requires an IndexHNSW instance");
+        FAISS_THROW_IF_NOT_MSG(
+                index->metric_type == METRIC_L2,
+                "HNSW ONNX inference currently supports METRIC_L2 only");
+        FAISS_THROW_IF_NOT_MSG(
+                bounded_queue,
+                "HNSW ONNX inference requires bounded_queue=true");
+        FAISS_THROW_IF_NOT_MSG(
+                !hnsw.is_panorama,
+                "HNSW ONNX inference does not support Panorama search");
+        FAISS_THROW_IF_NOT_FMT(
+                onnx_model->topk() == k,
+                "ONNX model top-k %d does not match search k %d",
+                onnx_model->topk(),
+                k);
+        FAISS_THROW_IF_NOT_MSG(
+                onnx_threshold >= 0.0f && onnx_threshold <= 1.0f,
+                "HNSW ONNX threshold must be between 0 and 1");
+        FAISS_THROW_IF_NOT_MSG(
+                index->level0_avg_neighbor_distance.size() ==
+                        static_cast<size_t>(index->ntotal),
+                "level-0 average neighbor distances are unavailable; call "
+                "compute_level0_avg_neighbor_distance() before ONNX search");
+        if (!feature_trace) {
+            feature_trace = &onnx_only_trace;
+        }
+        onnx_query = onnx_model->create_query();
     }
 
     if (feature_trace) {
@@ -1896,7 +2026,11 @@ HNSWStats search_impl(
                     0,
                     params,
                     index,
-                    feature_trace);
+                    feature_trace,
+                    onnx_query.get(),
+                    onnx_threshold,
+                    raw_data_query.get(),
+                    oracle_prefetch ? &oracle_final_set : nullptr);
         } else {
             // Panorama is L2-specific and is only valid for C_distance.
             // The public dispatch ensures we never reach this code path
@@ -1951,6 +2085,17 @@ HNSWStats search_impl(
 
     if (feature_trace) {
         collect_final_top_k<C>(res, *feature_trace);
+    }
+
+    if (raw_data_query) {
+        if (feature_trace) {
+            raw_data_query->finish(feature_trace->final_top_k_ids);
+        } else {
+            HNSWQueryTrace final_result;
+            final_result.k = k;
+            collect_final_top_k<C>(res, final_result);
+            raw_data_query->finish(final_result.final_top_k_ids);
+        }
     }
 
     vt.advance();

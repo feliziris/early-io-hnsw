@@ -5,6 +5,8 @@
  */
 
 #include <faiss/IndexHNSW.h>
+#include <faiss/impl/HNSWOnnxInference.h>
+#include <faiss/impl/HNSWRawDataPrefetch.h>
 #include <faiss/index_io.h>
 
 #include <algorithm>
@@ -72,6 +74,27 @@ long parse_positive(const char* value, const char* name) {
         throw std::runtime_error(std::string(name) + " must be positive");
     }
     return result;
+}
+
+float parse_probability(const char* value, const char* name) {
+    std::size_t parsed = 0;
+    const float result = std::stof(value, &parsed);
+    if (value[parsed] != '\0' || result < 0.0f || result > 1.0f) {
+        throw std::runtime_error(
+                std::string(name) + " must be between 0 and 1");
+    }
+    return result;
+}
+
+void print_latency(
+        const char* name,
+        const faiss::HNSWLatencyStatistics& latency) {
+    std::cout << name << "_count=" << latency.count << '\n'
+              << name << "_mean_us=" << latency.mean_us << '\n'
+              << name << "_p50_us=" << latency.p50_us << '\n'
+              << name << "_p95_us=" << latency.p95_us << '\n'
+              << name << "_p99_us=" << latency.p99_us << '\n'
+              << name << "_max_us=" << latency.max_us << '\n';
 }
 
 FvecsData read_all_fvecs(const std::string& path) {
@@ -219,11 +242,16 @@ void write_query_record(
 } // namespace
 
 int main(int argc, char** argv) {
-    if (argc != 8) {
+    if (argc < 8) {
         std::cerr
                 << "usage: " << argv[0]
                 << " <index> <query.fvecs> <trace.bin> <trace-index.tsv> "
-                   "<k> <efSearch> <batch-size>\n";
+                   "<k> <efSearch> <batch-size> "
+                   "[--onnx-model MODEL_ONNX] [--threshold VALUE] "
+                   "[--prefetch on|off --raw-data FILE "
+                   "--payload-size BYTES --io-workers N "
+                   "--io-queue-size N [--evict-file-cache] "
+                   "[--oracle-prefetch]]\n";
         return 2;
     }
 
@@ -241,6 +269,80 @@ int main(int argc, char** argv) {
                 static_cast<std::uint32_t>(ef_search_arg);
         const std::uint32_t batch_size =
                 static_cast<std::uint32_t>(batch_size_arg);
+        std::string onnx_model_path;
+        float onnx_threshold = 0.5f;
+        bool threshold_was_set = false;
+        std::string prefetch_mode;
+        std::string raw_data_path;
+        long payload_size = 512 * 1024;
+        long io_workers = 4;
+        long io_queue_size = 4096;
+        bool evict_file_cache = false;
+        bool oracle_prefetch = false;
+        for (int argument = 8; argument < argc;) {
+            const std::string option = argv[argument++];
+            if (option == "--evict-file-cache") {
+                evict_file_cache = true;
+                continue;
+            }
+            if (option == "--oracle-prefetch") {
+                // ORACLE EVALUATION ONLY: the measured search still runs the
+                // real model, but I/O submissions known to be false positives
+                // are filtered using a separately precomputed final top-k.
+                oracle_prefetch = true;
+                continue;
+            }
+            if (argument >= argc) {
+                throw std::runtime_error(option + " requires a value");
+            }
+            if (option == "--onnx-model") {
+                onnx_model_path = argv[argument++];
+            } else if (option == "--threshold") {
+                onnx_threshold =
+                        parse_probability(argv[argument++], "threshold");
+                threshold_was_set = true;
+            } else if (option == "--prefetch") {
+                prefetch_mode = argv[argument++];
+                if (prefetch_mode != "on" && prefetch_mode != "off") {
+                    throw std::runtime_error(
+                            "--prefetch must be either on or off");
+                }
+            } else if (option == "--raw-data") {
+                raw_data_path = argv[argument++];
+            } else if (option == "--payload-size") {
+                payload_size = parse_positive(
+                        argv[argument++], "payload-size");
+            } else if (option == "--io-workers") {
+                io_workers = parse_positive(argv[argument++], "io-workers");
+            } else if (option == "--io-queue-size") {
+                io_queue_size = parse_positive(
+                        argv[argument++], "io-queue-size");
+            } else {
+                throw std::runtime_error("unknown option: " + option);
+            }
+        }
+        const bool onnx_enabled = !onnx_model_path.empty();
+        if (threshold_was_set && !onnx_enabled) {
+            throw std::runtime_error(
+                    "--threshold requires --onnx-model");
+        }
+        const bool raw_io_enabled = !raw_data_path.empty();
+        if (raw_io_enabled != !prefetch_mode.empty()) {
+            throw std::runtime_error(
+                    "--raw-data and --prefetch must be specified together");
+        }
+        if (prefetch_mode == "on" && !onnx_enabled) {
+            throw std::runtime_error(
+                    "--prefetch on requires --onnx-model");
+        }
+        if (prefetch_mode == "off" && onnx_enabled) {
+            throw std::runtime_error(
+                    "baseline --prefetch off must not use --onnx-model");
+        }
+        if (oracle_prefetch && prefetch_mode != "on") {
+            throw std::runtime_error(
+                    "--oracle-prefetch requires --prefetch on");
+        }
 
         std::unique_ptr<faiss::Index> index = faiss::read_index_up(argv[1]);
         auto* hnsw_index = dynamic_cast<faiss::IndexHNSW*>(index.get());
@@ -281,10 +383,61 @@ int main(int argc, char** argv) {
         params.efSearch = static_cast<int>(ef_search);
         params.check_relative_distance = true;
         params.bounded_queue = true;
+        std::unique_ptr<faiss::HNSWOnnxModel> onnx_model;
+        if (onnx_enabled) {
+            onnx_model = std::make_unique<faiss::HNSWOnnxModel>(
+                    onnx_model_path);
+            params.onnx_model = onnx_model.get();
+            params.onnx_threshold = onnx_threshold;
+        }
+
+        std::vector<faiss::idx_t> oracle_final_ids;
+        double oracle_precompute_seconds = 0.0;
+        if (oracle_prefetch) {
+            // ORACLE EVALUATION ONLY: run the same deterministic HNSW search
+            // once without ONNX or raw I/O to obtain ground-truth final top-k
+            // IDs. This precomputation is outside all reported query latency.
+            oracle_final_ids.resize(
+                    static_cast<std::uint64_t>(queries.count) * k);
+            std::vector<float> oracle_distances(
+                    static_cast<std::uint64_t>(queries.count) * k);
+            faiss::SearchParametersHNSW oracle_params;
+            oracle_params.efSearch = static_cast<int>(ef_search);
+            oracle_params.check_relative_distance = true;
+            oracle_params.bounded_queue = true;
+            const auto oracle_started = std::chrono::steady_clock::now();
+            index->search(
+                    queries.count,
+                    queries.vectors.data(),
+                    k,
+                    oracle_distances.data(),
+                    oracle_final_ids.data(),
+                    &oracle_params);
+            oracle_precompute_seconds = std::chrono::duration<double>(
+                                                std::chrono::steady_clock::now() -
+                                                oracle_started)
+                                                .count();
+            params.oracle_prefetch = true;
+            params.oracle_k = k;
+        }
+        std::unique_ptr<faiss::HNSWRawDataPrefetcher> raw_data_prefetcher;
+        if (raw_io_enabled) {
+            raw_data_prefetcher =
+                    std::make_unique<faiss::HNSWRawDataPrefetcher>(
+                            raw_data_path,
+                            static_cast<std::size_t>(payload_size),
+                            static_cast<std::size_t>(io_workers),
+                            static_cast<std::size_t>(io_queue_size),
+                            evict_file_cache);
+            params.raw_data_prefetcher = raw_data_prefetcher.get();
+            params.prefetch_enabled = prefetch_mode == "on";
+        }
         faiss::HNSWFeatureCollector collector;
         params.feature_collector = &collector;
 
         const auto search_started = std::chrono::steady_clock::now();
+        std::uint64_t prediction_timesteps = 0;
+        std::uint64_t prefetch_decisions = 0;
         for (std::uint32_t first = 0; first < queries.count;
              first += batch_size) {
             const std::uint32_t count =
@@ -293,6 +446,12 @@ int main(int argc, char** argv) {
                     static_cast<std::uint64_t>(count) * k);
             std::vector<faiss::idx_t> labels(
                     static_cast<std::uint64_t>(count) * k);
+
+            if (oracle_prefetch) {
+                params.oracle_final_ids = oracle_final_ids.data() +
+                        static_cast<std::uint64_t>(first) * k;
+                params.oracle_query_count = count;
+            }
 
             index->search(
                     count,
@@ -310,6 +469,21 @@ int main(int argc, char** argv) {
             for (std::uint32_t local = 0; local < count; ++local) {
                 const std::uint32_t query_id = first + local;
                 const faiss::HNSWQueryTrace& trace = collector.queries[local];
+                if (onnx_enabled) {
+                    for (const auto& timestep : trace.timesteps) {
+                        if (timestep.prediction_probabilities.size() != k ||
+                            timestep.prefetch_decisions.size() != k) {
+                            throw std::runtime_error(
+                                    "incomplete ONNX prediction for query " +
+                                    std::to_string(query_id));
+                        }
+                        ++prediction_timesteps;
+                        prefetch_decisions += std::count(
+                                timestep.prefetch_decisions.begin(),
+                                timestep.prefetch_decisions.end(),
+                                static_cast<std::uint8_t>(1));
+                    }
+                }
                 for (std::uint32_t rank = 0; rank < k; ++rank) {
                     const std::uint64_t result_offset =
                             static_cast<std::uint64_t>(local) * k + rank;
@@ -319,6 +493,16 @@ int main(int argc, char** argv) {
                                 distances[result_offset]) {
                         throw std::runtime_error(
                                 "trace final top-k mismatch for query " +
+                                std::to_string(query_id));
+                    }
+                    if (oracle_prefetch &&
+                        labels[result_offset] !=
+                                oracle_final_ids
+                                        [static_cast<std::uint64_t>(query_id) *
+                                                 k +
+                                         rank]) {
+                        throw std::runtime_error(
+                                "oracle precompute mismatch for query " +
                                 std::to_string(query_id));
                     }
                 }
@@ -345,6 +529,9 @@ int main(int argc, char** argv) {
         if (!output || !index_output) {
             throw std::runtime_error("failed finalizing label outputs");
         }
+        if (raw_data_prefetcher) {
+            raw_data_prefetcher->drain();
+        }
 
         const double search_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - search_started)
@@ -361,8 +548,53 @@ int main(int argc, char** argv) {
                   << "positive_labels=" << total_stats.positives << '\n'
                   << "negative_labels="
                   << (total_stats.labels - total_stats.positives) << '\n'
+                  << "onnx_enabled=" << onnx_enabled << '\n'
+                  << "onnx_threshold=" << onnx_threshold << '\n'
+                  << "oracle_prefetch=" << oracle_prefetch << '\n'
+                  << "oracle_precompute_seconds="
+                  << oracle_precompute_seconds << '\n'
+                  << "prediction_timesteps=" << prediction_timesteps << '\n'
+                  << "prefetch_decisions=" << prefetch_decisions << '\n'
                   << "trace_path=" << argv[3] << '\n'
                   << "index_path=" << argv[4] << '\n';
+        if (raw_data_prefetcher) {
+            const faiss::HNSWRawDataSummary raw =
+                    raw_data_prefetcher->summary();
+            const uint64_t useful_payload_count =
+                    raw.prefetch_tp + raw.prefetch_fn;
+            const double wasted_io_ratio = useful_payload_count == 0
+                    ? 0.0
+                    : static_cast<double>(raw.prefetch_fp) /
+                            useful_payload_count;
+            std::cout << "raw_prefetch_enabled=" << raw.prefetch_enabled
+                      << '\n'
+                      << "raw_cache_eviction_advised="
+                      << raw.cache_eviction_advised << '\n'
+                      << "raw_payload_size=" << raw.payload_size << '\n'
+                      << "raw_payload_count=" << raw.payload_count << '\n'
+                      << "raw_query_count=" << raw.query_count << '\n'
+                      << "raw_async_read_count=" << raw.async_read_count
+                      << '\n'
+                      << "raw_demand_read_count=" << raw.demand_read_count
+                      << '\n'
+                      << "raw_prefetch_tp=" << raw.prefetch_tp << '\n'
+                      << "raw_prefetch_fp=" << raw.prefetch_fp << '\n'
+                      << "raw_prefetch_fn=" << raw.prefetch_fn << '\n'
+                      << "raw_wasted_io_ratio=" << wasted_io_ratio << '\n'
+                      << "raw_total_bytes_read=" << raw.total_bytes_read
+                      << '\n';
+            print_latency("raw_search", raw.search_latency);
+            print_latency(
+                    "raw_data_ready_wait", raw.data_ready_wait_latency);
+            print_latency("raw_end_to_end", raw.end_to_end_latency);
+            print_latency("raw_queue_wait", raw.queue_wait_latency);
+            print_latency("raw_mmap_read", raw.mmap_read_latency);
+            print_latency(
+                    "raw_decision_to_completion",
+                    raw.decision_to_completion_latency);
+            print_latency(
+                    "raw_late_demand_read", raw.late_demand_read_latency);
+        }
     } catch (const std::exception& error) {
         std::cerr << "error: " << error.what() << '\n';
         return 1;

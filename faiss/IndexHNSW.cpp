@@ -571,12 +571,27 @@ void hnsw_search(
 
     int efSearch = hnsw.efSearch;
     HNSWFeatureCollector* feature_collector = nullptr;
+    const SearchParametersHNSW* hnsw_params = nullptr;
     if (params) {
-        if (const SearchParametersHNSW* hnsw_params =
-                    dynamic_cast<const SearchParametersHNSW*>(params)) {
+        if ((hnsw_params =
+                     dynamic_cast<const SearchParametersHNSW*>(params))) {
             efSearch = hnsw_params->efSearch;
             feature_collector = hnsw_params->feature_collector;
         }
+    }
+
+    if (hnsw_params && hnsw_params->oracle_prefetch) {
+        FAISS_THROW_IF_NOT_MSG(
+                hnsw_params->oracle_final_ids,
+                "oracle prefetch requires final top-k IDs");
+        FAISS_THROW_IF_NOT_FMT(
+                hnsw_params->oracle_query_count == static_cast<size_t>(n),
+                "oracle query count %zu does not match search query count %" PRId64,
+                hnsw_params->oracle_query_count,
+                n);
+        FAISS_THROW_IF_NOT_MSG(
+                hnsw_params->oracle_k > 0,
+                "oracle prefetch requires oracle_k > 0");
     }
 
     if (feature_collector) {
@@ -636,12 +651,28 @@ void hnsw_search(
                         feature_trace->query_id = i;
                     }
 
+                    const SearchParameters* query_params = params;
+                    SearchParametersHNSW oracle_query_params;
+                    if (hnsw_params && hnsw_params->oracle_prefetch) {
+                        // ORACLE EVALUATION ONLY: select this query's known
+                        // final top-k row. The HNSW loop uses it only to drop
+                        // false-positive I/O submissions; search and model
+                        // inference are otherwise unchanged.
+                        oracle_query_params = *hnsw_params;
+                        oracle_query_params.oracle_final_ids =
+                                hnsw_params->oracle_final_ids +
+                                static_cast<size_t>(i) *
+                                        hnsw_params->oracle_k;
+                        oracle_query_params.oracle_query_count = 1;
+                        query_params = &oracle_query_params;
+                    }
+
                     HNSWStats stats = hnsw.search(
                             *dis,
                             index,
                             *res,
                             *vt,
-                            params,
+                            query_params,
                             feature_trace);
                     n1 += stats.n1;
                     n2 += stats.n2;

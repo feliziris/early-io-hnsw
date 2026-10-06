@@ -1,4 +1,6 @@
 h5py
 numpy
+onnx
+onnxruntime
 scikit-learn
 torch

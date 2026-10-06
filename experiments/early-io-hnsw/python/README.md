@@ -65,6 +65,23 @@ The Faiss runtime inference program will be kept separate from this offline
 trainer. It must use the feature order and normalization values saved in
 `best.pt`.
 
+## Stateful ONNX export
+
+Export all three checkpoints as one-timestep streaming LSTMs:
+
+```bash
+python3 export_onnx.py \
+  --topk 10 20 50
+```
+
+Each ONNX model accepts `features [1,k,6]`, `hidden_in [2,1,128]`, and
+`cell_in [2,1,128]`, and returns rank probabilities plus the next recurrent
+states. Feature normalization from `best.pt` is embedded in the graph. Models
+and validation reports are written beside each checkpoint as `model.onnx` and
+`onnx_export.json`. Export validation compares full-sequence PyTorch,
+one-timestep PyTorch, and one-timestep ONNX Runtime outputs on a real test
+trace.
+
 ## Offline inference
 
 Use the same `inference.py` for every trained top-k model. `--topk` selects
