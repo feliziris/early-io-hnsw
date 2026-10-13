@@ -15,11 +15,33 @@ import matplotlib.pyplot as plt
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--result-root", required=True, type=Path)
+    parser.add_argument("--result-root", type=Path)
+    parser.add_argument(
+        "--paired-summary",
+        type=Path,
+        help="paired_mean.tsv containing baseline and oracle/replay rows",
+    )
+    for topk in (10, 20, 50):
+        parser.add_argument(f"--summary-k{topk}", type=Path)
+    parser.add_argument("--query-count", type=int, default=2000)
+    parser.add_argument(
+        "--subtitle",
+        help="optional subtitle; defaults to the query/worker configuration",
+    )
+    parser.add_argument(
+        "--no-subtitle",
+        action="store_true",
+        help="omit the subtitle entirely",
+    )
     parser.add_argument(
         "--oracle-summary",
         type=Path,
         help="optional oracle_summary.tsv to add an Oracle bar to each k group",
+    )
+    parser.add_argument(
+        "--exclude-prefetch",
+        action="store_true",
+        help="omit the learned Prefetch bars (requires --oracle-summary)",
     )
     parser.add_argument("--output", required=True, type=Path)
     return parser.parse_args()
@@ -57,21 +79,83 @@ def load_oracle_summary(path: Path) -> dict[int, dict[str, float]]:
     return values
 
 
+def load_paired_summary(
+    path: Path,
+) -> tuple[dict[int, dict[str, dict[str, float]]], str]:
+    with path.open("r", encoding="utf-8", newline="") as handle:
+        rows = list(csv.DictReader(handle, delimiter="\t"))
+    values: dict[int, dict[str, dict[str, float]]] = {}
+    for row in rows:
+        topk = int(row["topk"])
+        mode = row["mode"]
+        values.setdefault(topk, {})[mode] = {
+            "search": float(row["search_mean_us"]) / 1000.0,
+            "wait": float(row["data_ready_wait_mean_us"]) / 1000.0,
+            "total": float(row["end_to_end_mean_us"]) / 1000.0,
+        }
+    comparison_modes = {
+        mode for topk_values in values.values() for mode in topk_values
+    } - {"baseline"}
+    if len(comparison_modes) != 1:
+        raise ValueError(f"{path} must contain one paired comparison mode")
+    comparison_mode = next(iter(comparison_modes))
+    expected_modes = {"baseline", comparison_mode}
+    if set(values) != {10, 20, 50} or any(
+        set(values[topk]) != expected_modes for topk in values
+    ):
+        raise ValueError(
+            f"{path} must contain baseline/{comparison_mode} rows for "
+            "k=10, 20, and 50"
+        )
+    return values, comparison_mode
+
+
 def main() -> None:
     args = parse_args()
     topks = (10, 20, 50)
-    values = {
-        topk: load_summary(args.result_root / f"k{topk}" / "summary.tsv")
-        for topk in topks
-    }
-    modes = ("off", "on")
-    labels = {"off": "Baseline", "on": "Prefetch"}
-    if args.oracle_summary:
-        oracle_values = load_oracle_summary(args.oracle_summary)
-        for topk in topks:
-            values[topk]["oracle"] = oracle_values[topk]
-        modes = ("off", "on", "oracle")
-        labels["oracle"] = "Oracle"
+    if args.paired_summary:
+        values, comparison_mode = load_paired_summary(args.paired_summary)
+        modes = ("baseline", comparison_mode)
+        comparison_labels = {
+            "oracle": "Oracle",
+            "replay": "LSTM replay\n(0 inference cost)",
+        }
+        labels = {
+            "baseline": "Baseline",
+            comparison_mode: comparison_labels.get(
+                comparison_mode, comparison_mode.capitalize()
+            ),
+        }
+    else:
+        summary_paths = {
+            topk: getattr(args, f"summary_k{topk}") for topk in topks
+        }
+        if any(path is None for path in summary_paths.values()):
+            if args.result_root is None:
+                raise ValueError(
+                    "provide --paired-summary, --result-root, or all of "
+                    "--summary-k10/20/50"
+                )
+            summary_paths = {
+                topk: args.result_root / f"k{topk}" / "summary.tsv"
+                for topk in topks
+            }
+        values = {
+            topk: load_summary(summary_paths[topk])
+            for topk in topks
+        }
+        modes = ("off", "on")
+        labels = {"off": "Baseline", "on": "Prefetch"}
+        if args.oracle_summary:
+            oracle_values = load_oracle_summary(args.oracle_summary)
+            for topk in topks:
+                values[topk]["oracle"] = oracle_values[topk]
+            modes = ("off", "on", "oracle")
+            labels["oracle"] = "Oracle"
+        if args.exclude_prefetch:
+            if not args.oracle_summary:
+                raise ValueError("--exclude-prefetch requires --oracle-summary")
+            modes = ("off", "oracle")
 
     colors = {"search": "#2563EB", "wait": "#F97316"}
     group_centers = {10: 0.0, 20: 4.0, 50: 8.0}
@@ -94,7 +178,11 @@ def main() -> None:
                 search,
                 width=bar_width,
                 color=colors["search"],
-                label="HNSW search + inference"
+                label=(
+                    "HNSW search"
+                    if args.exclude_prefetch or args.paired_summary
+                    else "HNSW search (+ inference for Prefetch)"
+                )
                 if topk == 10 and mode == modes[0]
                 else None,
             )
@@ -109,11 +197,21 @@ def main() -> None:
                 else None,
             )
 
-            if search >= 10:
+            ax.text(
+                position,
+                search / 2,
+                f"{search:.3f}",
+                ha="center",
+                va="center",
+                color="white",
+                fontsize=10,
+                fontweight="bold",
+            )
+            if wait >= 0.5:
                 ax.text(
                     position,
-                    search / 2,
-                    f"{search:.1f}",
+                    search + wait / 2,
+                    f"{wait:.3f}",
                     ha="center",
                     va="center",
                     color="white",
@@ -121,30 +219,27 @@ def main() -> None:
                     fontweight="bold",
                 )
             else:
-                ax.text(
-                    position,
-                    search + 2.5,
-                    f"{search:.1f}",
+                ax.annotate(
+                    f"I/O wait {wait:.3f} ms",
+                    xy=(position, total),
+                    xytext=(0, 19),
+                    textcoords="offset points",
                     ha="center",
                     va="bottom",
-                    color=colors["search"],
+                    color=colors["wait"],
                     fontsize=9,
                     fontweight="bold",
+                    arrowprops={
+                        "arrowstyle": "-",
+                        "color": colors["wait"],
+                        "linewidth": 1.0,
+                    },
                 )
-            ax.text(
-                position,
-                search + wait / 2,
-                f"{wait:.1f}",
-                ha="center",
-                va="center",
-                color="white",
-                fontsize=10,
-                fontweight="bold",
-            )
-            ax.text(
-                position,
-                total + 5,
-                f"{total:.1f}",
+            ax.annotate(
+                f"Total {total:.3f} ms",
+                xy=(position, total),
+                xytext=(0, 5),
+                textcoords="offset points",
                 ha="center",
                 va="bottom",
                 fontsize=10,
@@ -168,28 +263,25 @@ def main() -> None:
 
     ax.set_ylim(bottom=0)
     ax.set_ylabel("Mean latency (ms/query)", fontsize=12)
-    ax.set_title(
-        "Worker-Matched End-to-End Latency Breakdown",
-        fontsize=18,
-        fontweight="bold",
-        pad=28,
-    )
-    ax.text(
-        0.5,
-        1.015,
-        "2,000 seed-42 test queries · 4 I/O workers · batch size 1",
-        transform=ax.transAxes,
-        ha="center",
-        va="bottom",
-        fontsize=10,
-        color="#4B5563",
-    )
+    if not args.no_subtitle:
+        ax.text(
+            0.5,
+            1.01,
+            args.subtitle
+            or f"{args.query_count:,} seed-42 test queries · efSearch 200 · "
+            "4 I/O workers · batch size 1",
+            transform=ax.transAxes,
+            ha="center",
+            va="bottom",
+            fontsize=10,
+            color="#4B5563",
+        )
     ax.grid(axis="y", color="#D1D5DB", linewidth=0.8, alpha=0.8)
     ax.set_axisbelow(True)
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.legend(loc="upper left", frameon=False)
-    fig.subplots_adjust(bottom=0.17, top=0.86)
+    fig.subplots_adjust(bottom=0.17, top=0.93)
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(args.output, dpi=200, bbox_inches="tight", facecolor="white")

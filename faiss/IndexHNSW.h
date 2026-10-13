@@ -10,6 +10,7 @@
 #pragma once
 
 #include <optional>
+#include <string>
 #include <vector>
 
 #include <faiss/Index.h>
@@ -84,6 +85,15 @@ struct IndexHNSW : Index {
      * neighbor receive 0.0f.
      */
     void compute_level0_avg_neighbor_distance();
+
+    /** Persist/load the derived level-0 average-neighbor-distance feature.
+     *
+     * The sidecar contains index metadata and is rejected when it does not
+     * match this HNSW index. It is intentionally separate from the standard
+     * Faiss index serialization format.
+     */
+    void write_level0_avg_neighbor_distance(const std::string& path) const;
+    void read_level0_avg_neighbor_distance(const std::string& path);
 
     /// entry point for search
     void search(

@@ -13,10 +13,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 #include <limits>
 #include <memory>
 #include <queue>
+#include <string>
 
 #include <cstdint>
 #include "faiss/Index.h"
@@ -47,6 +49,27 @@ bool hnsw_deterministic_build = false;
  **************************************************************/
 
 namespace {
+
+constexpr char kAvgNeighborDistanceMagic[8] = {
+        'H', 'N', 'S', 'W', 'A', 'V', 'G', '1'};
+constexpr uint32_t kAvgNeighborDistanceVersion = 1;
+constexpr uint32_t kEndianMarker = 0x01020304;
+
+template <typename T>
+void write_avg_distance_value(std::ostream& output, const T& value) {
+    output.write(reinterpret_cast<const char*>(&value), sizeof(value));
+    FAISS_THROW_IF_NOT_MSG(
+            output.good(),
+            "failed writing HNSW average-neighbor-distance sidecar");
+}
+
+template <typename T>
+void read_avg_distance_value(std::istream& input, T& value) {
+    input.read(reinterpret_cast<char*>(&value), sizeof(value));
+    FAISS_THROW_IF_NOT_MSG(
+            input.good(),
+            "truncated HNSW average-neighbor-distance sidecar");
+}
 
 // Returns the storage's native distance computer. For similarity metrics
 // (e.g. METRIC_INNER_PRODUCT), distance values are real similarity scores
@@ -593,6 +616,15 @@ void hnsw_search(
                 hnsw_params->oracle_k > 0,
                 "oracle prefetch requires oracle_k > 0");
     }
+    if (hnsw_params && hnsw_params->prefetch_replay_queries) {
+        FAISS_THROW_IF_NOT_FMT(
+                hnsw_params->prefetch_replay_query_count ==
+                        static_cast<size_t>(n),
+                "prefetch replay query count %zu does not match search query "
+                "count %" PRId64,
+                hnsw_params->prefetch_replay_query_count,
+                n);
+    }
 
     if (feature_collector) {
         FAISS_THROW_IF_NOT_MSG(
@@ -652,19 +684,27 @@ void hnsw_search(
                     }
 
                     const SearchParameters* query_params = params;
-                    SearchParametersHNSW oracle_query_params;
+                    SearchParametersHNSW per_query_params;
                     if (hnsw_params && hnsw_params->oracle_prefetch) {
                         // ORACLE EVALUATION ONLY: select this query's known
                         // final top-k row. The HNSW loop uses it only to drop
                         // false-positive I/O submissions; search and model
                         // inference are otherwise unchanged.
-                        oracle_query_params = *hnsw_params;
-                        oracle_query_params.oracle_final_ids =
+                        per_query_params = *hnsw_params;
+                        per_query_params.oracle_final_ids =
                                 hnsw_params->oracle_final_ids +
                                 static_cast<size_t>(i) *
                                         hnsw_params->oracle_k;
-                        oracle_query_params.oracle_query_count = 1;
-                        query_params = &oracle_query_params;
+                        per_query_params.oracle_query_count = 1;
+                        query_params = &per_query_params;
+                    } else if (
+                            hnsw_params &&
+                            hnsw_params->prefetch_replay_queries) {
+                        per_query_params = *hnsw_params;
+                        per_query_params.prefetch_replay_queries =
+                                hnsw_params->prefetch_replay_queries + i;
+                        per_query_params.prefetch_replay_query_count = 1;
+                        query_params = &per_query_params;
                     }
 
                     HNSWStats stats = hnsw.search(
@@ -825,6 +865,109 @@ void IndexHNSW::compute_level0_avg_neighbor_distance() {
         }
     }
     omp_rethrow_if_exception(ex);
+}
+
+void IndexHNSW::write_level0_avg_neighbor_distance(
+        const std::string& path) const {
+    FAISS_THROW_IF_NOT_FMT(
+            level0_avg_neighbor_distance.size() ==
+                    static_cast<size_t>(ntotal),
+            "average-neighbor-distance count %zu does not match ntotal %" PRId64,
+            level0_avg_neighbor_distance.size(),
+            ntotal);
+
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    FAISS_THROW_IF_NOT_FMT(
+            output.is_open(), "cannot open sidecar for writing: %s", path.c_str());
+
+    output.write(kAvgNeighborDistanceMagic, sizeof(kAvgNeighborDistanceMagic));
+    write_avg_distance_value(output, kAvgNeighborDistanceVersion);
+    write_avg_distance_value(output, kEndianMarker);
+    const uint64_t stored_ntotal = static_cast<uint64_t>(ntotal);
+    const uint32_t stored_d = static_cast<uint32_t>(d);
+    const uint32_t stored_metric = static_cast<uint32_t>(metric_type);
+    const uint64_t stored_offsets = hnsw.offsets.size();
+    const uint64_t stored_neighbors = hnsw.neighbors.size();
+    const int32_t stored_max_level = hnsw.max_level;
+    const int32_t stored_entry_point = hnsw.entry_point;
+    write_avg_distance_value(output, stored_ntotal);
+    write_avg_distance_value(output, stored_d);
+    write_avg_distance_value(output, stored_metric);
+    write_avg_distance_value(output, stored_offsets);
+    write_avg_distance_value(output, stored_neighbors);
+    write_avg_distance_value(output, stored_max_level);
+    write_avg_distance_value(output, stored_entry_point);
+    output.write(
+            reinterpret_cast<const char*>(
+                    level0_avg_neighbor_distance.data()),
+            static_cast<std::streamsize>(
+                    level0_avg_neighbor_distance.size() * sizeof(float)));
+    FAISS_THROW_IF_NOT_MSG(
+            output.good(),
+            "failed writing HNSW average-neighbor-distance values");
+}
+
+void IndexHNSW::read_level0_avg_neighbor_distance(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    FAISS_THROW_IF_NOT_FMT(
+            input.is_open(), "cannot open sidecar for reading: %s", path.c_str());
+
+    char magic[sizeof(kAvgNeighborDistanceMagic)];
+    input.read(magic, sizeof(magic));
+    FAISS_THROW_IF_NOT_MSG(
+            input.good() &&
+                    std::memcmp(
+                            magic,
+                            kAvgNeighborDistanceMagic,
+                            sizeof(kAvgNeighborDistanceMagic)) == 0,
+            "invalid HNSW average-neighbor-distance sidecar magic");
+
+    uint32_t version = 0;
+    uint32_t endian_marker = 0;
+    uint64_t stored_ntotal = 0;
+    uint32_t stored_d = 0;
+    uint32_t stored_metric = 0;
+    uint64_t stored_offsets = 0;
+    uint64_t stored_neighbors = 0;
+    int32_t stored_max_level = -1;
+    int32_t stored_entry_point = -1;
+    read_avg_distance_value(input, version);
+    read_avg_distance_value(input, endian_marker);
+    read_avg_distance_value(input, stored_ntotal);
+    read_avg_distance_value(input, stored_d);
+    read_avg_distance_value(input, stored_metric);
+    read_avg_distance_value(input, stored_offsets);
+    read_avg_distance_value(input, stored_neighbors);
+    read_avg_distance_value(input, stored_max_level);
+    read_avg_distance_value(input, stored_entry_point);
+
+    FAISS_THROW_IF_NOT_FMT(
+            version == kAvgNeighborDistanceVersion,
+            "unsupported sidecar version %u",
+            version);
+    FAISS_THROW_IF_NOT_MSG(
+            endian_marker == kEndianMarker,
+            "sidecar byte order does not match this machine");
+    FAISS_THROW_IF_NOT_MSG(
+            stored_ntotal == static_cast<uint64_t>(ntotal) &&
+                    stored_d == static_cast<uint32_t>(d) &&
+                    stored_metric == static_cast<uint32_t>(metric_type) &&
+                    stored_offsets == hnsw.offsets.size() &&
+                    stored_neighbors == hnsw.neighbors.size() &&
+                    stored_max_level == hnsw.max_level &&
+                    stored_entry_point == hnsw.entry_point,
+            "sidecar metadata does not match the loaded HNSW index");
+
+    std::vector<float> loaded(static_cast<size_t>(ntotal));
+    input.read(
+            reinterpret_cast<char*>(loaded.data()),
+            static_cast<std::streamsize>(loaded.size() * sizeof(float)));
+    FAISS_THROW_IF_NOT_MSG(
+            input.good(), "truncated HNSW average-neighbor-distance values");
+    FAISS_THROW_IF_NOT_MSG(
+            input.peek() == std::char_traits<char>::eof(),
+            "unexpected trailing bytes in average-neighbor-distance sidecar");
+    level0_avg_neighbor_distance = std::move(loaded);
 }
 
 void IndexHNSW::reset() {

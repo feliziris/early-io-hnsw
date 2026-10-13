@@ -146,26 +146,26 @@ params.prefetch_enabled = true;
   --prefetch on --raw-data payload512k.bin \
   --payload-size 524288 --io-workers 4 --io-queue-size 4096
 
-# ORACLE EVALUATION ONLY: 모델의 FP I/O를 제거한 비교군
+# IDEAL ORACLE EVALUATION ONLY: 모델 비용 0, 정답 기반 비교군
 ./build-onnx/demos/generate_sift_query_labels \
   INDEX QUERY TRACE TRACE_INDEX 10 200 10 \
-  --onnx-model model.onnx --threshold 0.5 \
   --prefetch on --oracle-prefetch --raw-data payload512k.bin \
   --payload-size 524288 --io-workers 4 --io-queue-size 4096
 ```
 
-`--oracle-prefetch`는 실제 시스템에 배포할 수 있는 정책이 아니라 FP I/O의
-영향을 분리하기 위한 평가 전용 모드다. 프로그램은 먼저 ONNX와 raw I/O 없이
+`--oracle-prefetch`는 실제 시스템에 배포할 수 있는 정책이 아니라 모델 실행
+비용과 분류 오류를 모두 제거한 이상적인 평가 전용 모드다. 프로그램은 먼저
+ONNX와 raw I/O 없이
 동일한 HNSW 파라미터로 모든 query의 최종 top-k를 계산한다. 이 시간은
 `oracle_precompute_seconds`로 별도 출력되며 아래의 query latency에는 포함되지
-않는다. 측정 검색에서는 기존 모델 추론과 threshold 판단을 그대로 수행하되,
-미리 계산한 최종 top-k에 속하지 않는 예측 node의 I/O 제출만 차단한다.
-검색 traversal, 결과 queue, trace 및 모델 출력은 일반 prefetch와 동일하다.
+않는다. 측정 검색에서는 ONNX 모델을 생성하거나 실행하지 않는다. 각 timestep의
+결과 queue에서 미리 계산한 최종 top-k 노드를 발견하는 즉시 I/O를 제출하고,
+동일한 노드는 한 번만 요청한다. 따라서 `FP=0`, 모델 추론 timestep은 0이며,
+검색 traversal과 결과 queue 갱신 방식은 일반 검색과 동일하다.
 
-같은 cache 조건에서 일반 prefetch와 oracle을 짝지어 실행했을 때
-`raw_data_ready_wait` 차이는 FP 요청의 queue 및 저장장치 경합이 최종 결과 준비를
-지연시킨 정도를 근사한다. I/O가 서로 겹쳐 실행되므로 TP와 FP의 지연시간을
-개별 요청 시간처럼 단순 합산해서 정확히 분해할 수는 없다.
+일반 prefetch와 oracle의 end-to-end 차이에는 모델 실행 비용, 잘못된 예측,
+결정 지연의 영향이 함께 포함된다. I/O가 서로 겹쳐 실행되므로 각 요인의
+지연시간을 단순 합산해서 정확히 분해할 수는 없다.
 
 출력에는 query별 `search`, `data_ready_wait`, `end_to_end` latency 분포와
 비동기 queue wait, 실제 mmap read, decision-to-completion latency가 포함된다.
@@ -224,6 +224,81 @@ cmake --build build-onnx --target generate_sift_query_labels -j2
   INDEX QUERY TRACE TRACE_INDEX 10 200 10 \
   --onnx-model MODEL_ONNX --threshold 0.5
 ```
+
+## 평균 이웃 거리 오프라인 저장 및 로드
+
+`avg_neigh_dist`는 쿼리가 아니라 완성된 HNSW 그래프에 종속되는 값이다.
+따라서 큰 인덱스에서는 검색 실행마다 계산하지 않고 인덱스당 한 번 계산해
+바이너리 sidecar로 저장한다.
+
+```bash
+cmake --build build-cpu \
+  --target precompute_hnsw_avg_neighbor_distance --parallel 4
+
+./build-cpu/demos/precompute_hnsw_avg_neighbor_distance \
+  INDEX.faiss INDEX.level0_avg_neighbor_distance.bin
+```
+
+이후 검색 및 trace 생성 시 파일을 로드한다.
+
+```bash
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX.faiss QUERY.fvecs TRACE.bin TRACE_INDEX.tsv 10 200 1 \
+  --avg-neighbor-distance INDEX.level0_avg_neighbor_distance.bin \
+  --onnx-model MODEL.onnx --threshold 0.5
+```
+
+## ONNX Runtime CPU/CUDA 실행 선택
+
+검색 루프의 LSTM 추론 provider는 실행 시 선택한다. `gpu`는 `cuda`의
+별칭이며, CUDA를 명시했는데 `CUDAExecutionProvider`를 사용할 수 없으면
+CPU로 조용히 대체하지 않고 오류를 낸다.
+
+```bash
+# CPU
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX.faiss QUERY.fvecs TRACE.bin TRACE_INDEX.tsv 10 200 1 \
+  --onnx-model MODEL.onnx --onnx-provider cpu
+
+# CUDA device 0
+./build-onnx/demos/generate_sift_query_labels \
+  INDEX.faiss QUERY.fvecs TRACE.bin TRACE_INDEX.tsv 10 200 1 \
+  --onnx-model MODEL.onnx --onnx-provider cuda --onnx-device-id 0
+```
+
+벤치마크 스크립트에서는 `ONNX_PROVIDER`와 `ONNX_DEVICE_ID` 환경변수를
+사용한다.
+
+```bash
+ONNX_PROVIDER=cuda ONNX_DEVICE_ID=0 \
+  experiments/early-io-hnsw/run_hnsw_prefetch_benchmark.sh 1 10 1 0.5
+```
+
+CUDA 경로는 쿼리별 LSTM hidden/cell state를 GPU 메모리의 두 버퍼에서
+번갈아 사용한다. 따라서 매 타임스텝마다 recurrent state를 CPU로 다시
+복사하지 않는다. 현재 HNSW feature는 CPU에서 생성되고, prefetch 결정을
+위한 확률은 매 타임스텝 CPU로 반환되므로 동기화 비용은 남아 있다.
+
+Jetson CUDA 12.6 환경에는 `onnxruntime-gpu 1.24.0`을 설치했다. k=10
+모델의 500 timestep 검증에서 CPU/CUDA 출력의 최대 절대 오차는 1e-4
+이하였으며 검증을 통과했다. 동일한 1,000개 쿼리, `efSearch=200`,
+threshold 0.5 조건의 평균 결과는 다음과 같다.
+
+| provider | search (ms/query) | I/O wait (ms/query) | end-to-end (ms/query) |
+|---|---:|---:|---:|
+| CPU | 28.424166 | 0.003216 | 28.427382 |
+| CUDA | 204.231308 | 0.004390 | 204.235698 |
+
+CUDA의 end-to-end latency는 CPU의 약 7.18배였다. 배치 1의 작은 LSTM을
+약 200 timestep 동안 개별 실행하며 각 timestep에 확률을 동기화하는 현재
+구조에서는 GPU kernel launch와 CPU/GPU 동기화 비용이 계산 이득보다 크다.
+원본 로그와 통합 결과는
+`workspace/results/hnsw_sift10m_4k/20261007_k10_cpu_vs_cuda/`에 있다.
+
+sidecar에는 값뿐 아니라 `ntotal`, 차원, metric, 그래프 배열 크기,
+entry point와 max level이 함께 저장된다. 로드한 인덱스와 메타데이터가
+다르면 사용하지 않고 오류를 낸다. 그래프에 `add()` 또는 `reset()`을 한
+뒤에는 기존 sidecar를 재사용하지 말고 다시 생성해야 한다.
 
 ## 코드와 실행 방법
 

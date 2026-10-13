@@ -10,6 +10,8 @@ repetitions="${1:-1}"
 topk="${2:-10}"
 batch_size="${3:-1}"
 threshold="${4:-0.5}"
+onnx_provider="${ONNX_PROVIDER:-cpu}"
+onnx_device_id="${ONNX_DEVICE_ID:-0}"
 
 ef_search="${EF_SEARCH:-200}"
 io_workers="${IO_WORKERS:-4}"
@@ -21,6 +23,10 @@ index="${INDEX_PATH:-${project_root}/output/sift100k_hnsw_m32_efc200_efs200.inde
 queries="${QUERY_PATH:-${project_root}/output/sift_query_test_seed42.fvecs}"
 raw_data="${RAW_DATA_PATH:-${workspace_root}/raw_data/payload512k.bin}"
 onnx_model="${ONNX_MODEL_PATH:-${workspace_root}/model/sift/lstm_io/k${topk}/model.onnx}"
+avg_neighbor_distance="${AVG_NEIGHBOR_DISTANCE_PATH:-}"
+if [[ -z "${avg_neighbor_distance}" && -f "${index%.*}.level0_avg_neighbor_distance.bin" ]]; then
+    avg_neighbor_distance="${index%.*}.level0_avg_neighbor_distance.bin"
+fi
 
 run_id="$(date +%Y%m%d_%H%M%S)_$$"
 result_dir="${RESULT_DIR:-${workspace_root}/results/hnsw_live_prefetch/${run_id}}"
@@ -56,6 +62,9 @@ require_file "${index}"
 require_file "${queries}"
 require_file "${raw_data}"
 require_file "${onnx_model}"
+if [[ -n "${avg_neighbor_distance}" ]]; then
+    require_file "${avg_neighbor_distance}"
+fi
 
 mkdir -p "${result_dir}"
 printf 'round\tmode\tsearch_mean_us\tdata_ready_wait_mean_us\tend_to_end_mean_us\ttp\tfp\tfn\twasted_io_ratio\ttotal_bytes_read\tlog\n' >"${summary}"
@@ -76,10 +85,15 @@ run_one() {
         "${ef_search}"
         "${batch_size}"
     )
+    if [[ -n "${avg_neighbor_distance}" ]]; then
+        command+=(--avg-neighbor-distance "${avg_neighbor_distance}")
+    fi
 
     if [[ "${mode}" == "on" ]]; then
         command+=(
             --onnx-model "${onnx_model}"
+            --onnx-provider "${onnx_provider}"
+            --onnx-device-id "${onnx_device_id}"
             --threshold "${threshold}"
         )
     fi
@@ -124,6 +138,9 @@ index=${index}
 queries=${queries}
 raw_data=${raw_data}
 onnx_model=${onnx_model}
+onnx_provider=${onnx_provider}
+onnx_device_id=${onnx_device_id}
+avg_neighbor_distance=${avg_neighbor_distance:-computed_at_startup}
 omp_num_threads=1
 evict_file_cache=true
 EOF

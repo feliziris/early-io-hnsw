@@ -1255,7 +1255,8 @@ int search_from_candidates_fixVT(
         HNSWOnnxQuery* onnx_query = nullptr,
         float onnx_threshold = 0.5f,
         HNSWRawDataQuery* raw_data_query = nullptr,
-        const std::unordered_set<int32_t>* oracle_final_ids = nullptr) {
+        const std::unordered_set<int32_t>* oracle_final_ids = nullptr,
+        const HNSWPrefetchReplayQuery* prefetch_replay = nullptr) {
     int nres = nres_in;
     int ndis = 0;
 
@@ -1386,7 +1387,36 @@ int search_from_candidates_fixVT(
                     nstep,
                     previous_rank_ids,
                     rank_persistence_counts);
-            if (onnx_query && !feature_trace->timesteps.empty()) {
+            if (prefetch_replay && !feature_trace->timesteps.empty()) {
+                const size_t timestep_index = static_cast<size_t>(nstep - 1);
+                // A replay run may execute trailing efSearch-boundary steps
+                // that were absent while recording. There is no recorded
+                // model decision for those steps, so they intentionally submit
+                // nothing; all recorded decisions retain their exact timing.
+                if (timestep_index <
+                    prefetch_replay->timestep_node_ids.size()) {
+                    for (int32_t node_id :
+                         prefetch_replay->timestep_node_ids[timestep_index]) {
+                        if (raw_data_query && node_id >= 0) {
+                            raw_data_query->submit(node_id);
+                        }
+                    }
+                }
+            } else if (
+                    oracle_final_ids && !feature_trace->timesteps.empty()) {
+                // IDEAL ORACLE EVALUATION ONLY: the model has zero execution
+                // cost and every final top-k node is submitted as soon as it
+                // appears in the observable result queue. submit() deduplicates
+                // nodes that remain in the queue across later timesteps.
+                const HNSWFeatureTimestep& timestep =
+                        feature_trace->timesteps.back();
+                for (int32_t node_id : timestep.node_ids) {
+                    if (raw_data_query && node_id >= 0 &&
+                        oracle_final_ids->count(node_id) != 0) {
+                        raw_data_query->submit(node_id);
+                    }
+                }
+            } else if (onnx_query && !feature_trace->timesteps.empty()) {
                 HNSWFeatureTimestep& timestep =
                         feature_trace->timesteps.back();
                 timestep.prediction_probabilities = onnx_query->predict(
@@ -1402,15 +1432,7 @@ int search_from_candidates_fixVT(
                                     onnx_threshold);
                     if (raw_data_query &&
                         timestep.prefetch_decisions[rank] &&
-                        timestep.node_ids[rank] >= 0 &&
-                        (!oracle_final_ids ||
-                         oracle_final_ids->count(
-                                 timestep.node_ids[rank]) != 0)) {
-                        // ORACLE EVALUATION ONLY: when oracle_final_ids is
-                        // present, preserve model inference and its threshold
-                        // decisions but suppress I/O for predicted nodes that
-                        // are not members of the known final top-k. This
-                        // isolates the storage-latency cost of false positives.
+                        timestep.node_ids[rank] >= 0) {
                         raw_data_query->submit(timestep.node_ids[rank]);
                     }
                 }
@@ -1420,6 +1442,14 @@ int search_from_candidates_fixVT(
             break;
         }
     }
+
+    FAISS_THROW_IF_NOT_FMT(
+            !prefetch_replay ||
+                    static_cast<size_t>(nstep) >=
+                            prefetch_replay->timestep_node_ids.size(),
+            "prefetch replay timestep count %zu does not match search %d",
+            prefetch_replay ? prefetch_replay->timestep_node_ids.size() : 0,
+            nstep);
 
     if (level == 0) {
         stats.n1++;
@@ -1451,7 +1481,8 @@ int search_from_candidates_dispatch(
         HNSWOnnxQuery* onnx_query = nullptr,
         float onnx_threshold = 0.5f,
         HNSWRawDataQuery* raw_data_query = nullptr,
-        const std::unordered_set<int32_t>* oracle_final_ids = nullptr) {
+        const std::unordered_set<int32_t>* oracle_final_ids = nullptr,
+        const HNSWPrefetchReplayQuery* prefetch_replay = nullptr) {
     auto call = [&]<typename VTType>(VTType& vt_concrete) -> int {
         return search_from_candidates_fixVT<VTType, C>(
                 hnsw,
@@ -1468,7 +1499,8 @@ int search_from_candidates_dispatch(
                 onnx_query,
                 onnx_threshold,
                 raw_data_query,
-                oracle_final_ids);
+                oracle_final_ids,
+                prefetch_replay);
     };
     if (VisitedTableVector* vtv = dynamic_cast<VisitedTableVector*>(&vt)) {
         return call(*vtv);
@@ -1892,6 +1924,7 @@ HNSWStats search_impl(
     bool oracle_prefetch = false;
     const idx_t* oracle_final_ids = nullptr;
     size_t oracle_k = 0;
+    const HNSWPrefetchReplayQuery* prefetch_replay = nullptr;
     if (params) {
         if (const SearchParametersHNSW* hnsw_params =
                     dynamic_cast<const SearchParametersHNSW*>(params)) {
@@ -1904,6 +1937,7 @@ HNSWStats search_impl(
             oracle_prefetch = hnsw_params->oracle_prefetch;
             oracle_final_ids = hnsw_params->oracle_final_ids;
             oracle_k = hnsw_params->oracle_k;
+            prefetch_replay = hnsw_params->prefetch_replay_queries;
         }
     }
 
@@ -1911,8 +1945,15 @@ HNSWStats search_impl(
             !prefetch_enabled || raw_data_prefetcher,
             "prefetch_enabled=true requires a raw data prefetcher");
     FAISS_THROW_IF_NOT_MSG(
-            !prefetch_enabled || onnx_model,
-            "prefetch_enabled=true requires an ONNX model");
+            !prefetch_enabled || onnx_model || oracle_prefetch ||
+                    prefetch_replay,
+            "prefetch_enabled=true requires ONNX, oracle, or replay mode");
+    FAISS_THROW_IF_NOT_MSG(
+            !(onnx_model && prefetch_replay),
+            "prefetch replay must not execute an ONNX model");
+    FAISS_THROW_IF_NOT_MSG(
+            !(oracle_prefetch && prefetch_replay),
+            "prefetch replay and oracle mode are mutually exclusive");
     FAISS_THROW_IF_NOT_MSG(
             !oracle_prefetch || prefetch_enabled,
             "oracle prefetch requires prefetch_enabled=true");
@@ -2030,7 +2071,8 @@ HNSWStats search_impl(
                     onnx_query.get(),
                     onnx_threshold,
                     raw_data_query.get(),
-                    oracle_prefetch ? &oracle_final_set : nullptr);
+                    oracle_prefetch ? &oracle_final_set : nullptr,
+                    prefetch_replay);
         } else {
             // Panorama is L2-specific and is only valid for C_distance.
             // The public dispatch ensures we never reach this code path

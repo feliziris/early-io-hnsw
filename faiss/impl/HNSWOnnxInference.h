@@ -40,7 +40,11 @@ class HNSWOnnxModel {
    public:
     struct Impl;
 
-    explicit HNSWOnnxModel(const std::string& model_path);
+    /** provider is "cpu" or "cuda" ("gpu" is accepted as a CUDA alias). */
+    explicit HNSWOnnxModel(
+            const std::string& model_path,
+            const std::string& provider = "cpu",
+            int device_id = 0);
     ~HNSWOnnxModel();
 
     HNSWOnnxModel(HNSWOnnxModel&&) noexcept;
@@ -54,6 +58,8 @@ class HNSWOnnxModel {
     int num_layers() const;
     int hidden_size() const;
     const std::string& model_path() const;
+    const std::string& provider() const;
+    int device_id() const;
 
     std::unique_ptr<HNSWOnnxQuery> create_query() const;
 

@@ -24,6 +24,12 @@ target_link_libraries(build_sift100k_hnsw PRIVATE faiss)
 add_executable(generate_sift_query_labels EXCLUDE_FROM_ALL generate_sift_query_labels.cpp)
 target_link_libraries(generate_sift_query_labels PRIVATE faiss)
 
+add_executable(precompute_hnsw_avg_neighbor_distance EXCLUDE_FROM_ALL precompute_hnsw_avg_neighbor_distance.cpp)
+target_link_libraries(precompute_hnsw_avg_neighbor_distance PRIVATE faiss)
+
+add_executable(validate_hnsw_onnx_providers EXCLUDE_FROM_ALL validate_hnsw_onnx_providers.cpp)
+target_link_libraries(validate_hnsw_onnx_providers PRIVATE faiss)
+
 add_executable(demo_weighted_kmeans EXCLUDE_FROM_ALL demo_weighted_kmeans.cpp)
 target_link_libraries(demo_weighted_kmeans PRIVATE faiss)
 

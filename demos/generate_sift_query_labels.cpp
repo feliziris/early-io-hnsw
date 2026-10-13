@@ -26,6 +26,8 @@ namespace {
 
 constexpr std::uint32_t kFormatVersion = 1;
 constexpr char kMagic[8] = {'H', 'N', 'S', 'W', 'T', 'R', 'C', '1'};
+constexpr std::uint32_t kReplayFormatVersion = 1;
+constexpr char kReplayMagic[8] = {'H', 'N', 'S', 'W', 'R', 'P', 'L', '1'};
 
 struct FvecsData {
     std::int32_t dimension = 0;
@@ -45,6 +47,105 @@ void write_value(std::ostream& output, const T& value) {
     if (!output) {
         throw std::runtime_error("failed writing label output");
     }
+}
+
+template <typename T>
+T read_value(std::istream& input, const char* description) {
+    T value{};
+    input.read(reinterpret_cast<char*>(&value), sizeof(value));
+    if (!input) {
+        throw std::runtime_error(
+                std::string("failed reading replay ") + description);
+    }
+    return value;
+}
+
+struct PrefetchReplayFile {
+    std::uint32_t query_count = 0;
+    std::uint32_t k = 0;
+    std::uint32_t ef_search = 0;
+    float threshold = 0.0f;
+    std::vector<faiss::HNSWPrefetchReplayQuery> queries;
+};
+
+void write_prefetch_replay(
+        const std::string& path,
+        const PrefetchReplayFile& replay) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    if (!output) {
+        throw std::runtime_error("cannot open prefetch replay output: " + path);
+    }
+    output.write(kReplayMagic, sizeof(kReplayMagic));
+    write_value(output, kReplayFormatVersion);
+    write_value(output, replay.query_count);
+    write_value(output, replay.k);
+    write_value(output, replay.ef_search);
+    write_value(output, replay.threshold);
+    for (std::uint32_t query = 0; query < replay.query_count; ++query) {
+        const auto& timesteps = replay.queries[query].timestep_node_ids;
+        const std::uint32_t timestep_count =
+                static_cast<std::uint32_t>(timesteps.size());
+        write_value(output, query);
+        write_value(output, timestep_count);
+        for (const auto& node_ids : timesteps) {
+            const std::uint32_t node_count =
+                    static_cast<std::uint32_t>(node_ids.size());
+            write_value(output, node_count);
+            for (std::int32_t node_id : node_ids) {
+                write_value(output, node_id);
+            }
+        }
+    }
+}
+
+PrefetchReplayFile read_prefetch_replay(const std::string& path) {
+    std::ifstream input(path, std::ios::binary);
+    if (!input) {
+        throw std::runtime_error("cannot open prefetch replay input: " + path);
+    }
+    char magic[sizeof(kReplayMagic)]{};
+    input.read(magic, sizeof(magic));
+    if (!input || std::memcmp(magic, kReplayMagic, sizeof(magic)) != 0) {
+        throw std::runtime_error("invalid prefetch replay magic: " + path);
+    }
+    const std::uint32_t version =
+            read_value<std::uint32_t>(input, "version");
+    if (version != kReplayFormatVersion) {
+        throw std::runtime_error("unsupported prefetch replay version");
+    }
+    PrefetchReplayFile replay;
+    replay.query_count = read_value<std::uint32_t>(input, "query count");
+    replay.k = read_value<std::uint32_t>(input, "k");
+    replay.ef_search = read_value<std::uint32_t>(input, "efSearch");
+    replay.threshold = read_value<float>(input, "threshold");
+    replay.queries.resize(replay.query_count);
+    for (std::uint32_t query = 0; query < replay.query_count; ++query) {
+        const std::uint32_t stored_query =
+                read_value<std::uint32_t>(input, "query ID");
+        if (stored_query != query) {
+            throw std::runtime_error("prefetch replay query IDs are not ordered");
+        }
+        const std::uint32_t timestep_count =
+                read_value<std::uint32_t>(input, "timestep count");
+        auto& timesteps = replay.queries[query].timestep_node_ids;
+        timesteps.resize(timestep_count);
+        for (auto& node_ids : timesteps) {
+            const std::uint32_t node_count =
+                    read_value<std::uint32_t>(input, "node count");
+            if (node_count > replay.k) {
+                throw std::runtime_error(
+                        "prefetch replay timestep has more than k nodes");
+            }
+            node_ids.resize(node_count);
+            for (std::int32_t& node_id : node_ids) {
+                node_id = read_value<std::int32_t>(input, "node ID");
+            }
+        }
+    }
+    if (input.peek() != std::ifstream::traits_type::eof()) {
+        throw std::runtime_error("prefetch replay has trailing data");
+    }
+    return replay;
 }
 
 void write_header(
@@ -72,6 +173,15 @@ long parse_positive(const char* value, const char* name) {
     const long result = std::stol(value, &parsed);
     if (value[parsed] != '\0' || result <= 0) {
         throw std::runtime_error(std::string(name) + " must be positive");
+    }
+    return result;
+}
+
+long parse_nonnegative(const char* value, const char* name) {
+    std::size_t parsed = 0;
+    const long result = std::stol(value, &parsed);
+    if (value[parsed] != '\0' || result < 0) {
+        throw std::runtime_error(std::string(name) + " must be non-negative");
     }
     return result;
 }
@@ -247,11 +357,16 @@ int main(int argc, char** argv) {
                 << "usage: " << argv[0]
                 << " <index> <query.fvecs> <trace.bin> <trace-index.tsv> "
                    "<k> <efSearch> <batch-size> "
-                   "[--onnx-model MODEL_ONNX] [--threshold VALUE] "
+                   "[--avg-neighbor-distance SIDECAR] "
+                   "[--onnx-model MODEL_ONNX] "
+                   "[--onnx-provider cpu|cuda] [--onnx-device-id N] "
+                   "[--threshold VALUE] "
                    "[--prefetch on|off --raw-data FILE "
                    "--payload-size BYTES --io-workers N "
                    "--io-queue-size N [--evict-file-cache] "
-                   "[--oracle-prefetch]]\n";
+                   "[--warmup-search] [--oracle-prefetch] "
+                   "[--prefetch-record-out FILE] "
+                   "[--prefetch-replay-in FILE]]\n";
         return 2;
     }
 
@@ -270,6 +385,11 @@ int main(int argc, char** argv) {
         const std::uint32_t batch_size =
                 static_cast<std::uint32_t>(batch_size_arg);
         std::string onnx_model_path;
+        std::string onnx_provider = "cpu";
+        long onnx_device_id = 0;
+        bool onnx_provider_was_set = false;
+        bool onnx_device_id_was_set = false;
+        std::string avg_neighbor_distance_path;
         float onnx_threshold = 0.5f;
         bool threshold_was_set = false;
         std::string prefetch_mode;
@@ -279,6 +399,9 @@ int main(int argc, char** argv) {
         long io_queue_size = 4096;
         bool evict_file_cache = false;
         bool oracle_prefetch = false;
+        bool warmup_search = false;
+        std::string prefetch_record_path;
+        std::string prefetch_replay_path;
         for (int argument = 8; argument < argc;) {
             const std::string option = argv[argument++];
             if (option == "--evict-file-cache") {
@@ -286,17 +409,38 @@ int main(int argc, char** argv) {
                 continue;
             }
             if (option == "--oracle-prefetch") {
-                // ORACLE EVALUATION ONLY: the measured search still runs the
-                // real model, but I/O submissions known to be false positives
-                // are filtered using a separately precomputed final top-k.
+                // IDEAL ORACLE EVALUATION ONLY: precompute the final top-k,
+                // then run the measured search without an ONNX model.
                 oracle_prefetch = true;
+                continue;
+            }
+            if (option == "--warmup-search") {
+                warmup_search = true;
                 continue;
             }
             if (argument >= argc) {
                 throw std::runtime_error(option + " requires a value");
             }
-            if (option == "--onnx-model") {
+            if (option == "--avg-neighbor-distance") {
+                avg_neighbor_distance_path = argv[argument++];
+            } else if (option == "--prefetch-record-out") {
+                prefetch_record_path = argv[argument++];
+            } else if (option == "--prefetch-replay-in") {
+                prefetch_replay_path = argv[argument++];
+            } else if (option == "--onnx-model") {
                 onnx_model_path = argv[argument++];
+            } else if (option == "--onnx-provider") {
+                onnx_provider = argv[argument++];
+                onnx_provider_was_set = true;
+                if (onnx_provider != "cpu" && onnx_provider != "cuda" &&
+                    onnx_provider != "gpu") {
+                    throw std::runtime_error(
+                            "--onnx-provider must be cpu, cuda, or gpu");
+                }
+            } else if (option == "--onnx-device-id") {
+                onnx_device_id = parse_nonnegative(
+                        argv[argument++], "onnx-device-id");
+                onnx_device_id_was_set = true;
             } else if (option == "--threshold") {
                 onnx_threshold =
                         parse_probability(argv[argument++], "threshold");
@@ -326,14 +470,24 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                     "--threshold requires --onnx-model");
         }
+        if ((onnx_provider_was_set || onnx_device_id_was_set) &&
+            !onnx_enabled) {
+            throw std::runtime_error(
+                    "--onnx-provider and --onnx-device-id require "
+                    "--onnx-model");
+        }
         const bool raw_io_enabled = !raw_data_path.empty();
         if (raw_io_enabled != !prefetch_mode.empty()) {
             throw std::runtime_error(
                     "--raw-data and --prefetch must be specified together");
         }
-        if (prefetch_mode == "on" && !onnx_enabled) {
+        const bool replay_enabled = !prefetch_replay_path.empty();
+        const bool record_enabled = !prefetch_record_path.empty();
+        if (prefetch_mode == "on" && !onnx_enabled && !oracle_prefetch &&
+            !replay_enabled) {
             throw std::runtime_error(
-                    "--prefetch on requires --onnx-model");
+                    "--prefetch on requires --onnx-model or "
+                    "--oracle-prefetch or --prefetch-replay-in");
         }
         if (prefetch_mode == "off" && onnx_enabled) {
             throw std::runtime_error(
@@ -343,6 +497,30 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                     "--oracle-prefetch requires --prefetch on");
         }
+        if (oracle_prefetch && onnx_enabled) {
+            throw std::runtime_error(
+                    "ideal --oracle-prefetch must not use --onnx-model");
+        }
+        if (record_enabled && !onnx_enabled) {
+            throw std::runtime_error(
+                    "--prefetch-record-out requires --onnx-model");
+        }
+        if (replay_enabled && onnx_enabled) {
+            throw std::runtime_error(
+                    "--prefetch-replay-in must not use --onnx-model");
+        }
+        if (record_enabled && replay_enabled) {
+            throw std::runtime_error(
+                    "prefetch record and replay modes are mutually exclusive");
+        }
+        if (replay_enabled && prefetch_mode != "on") {
+            throw std::runtime_error(
+                    "--prefetch-replay-in requires --prefetch on");
+        }
+        if (replay_enabled && oracle_prefetch) {
+            throw std::runtime_error(
+                    "prefetch replay and oracle mode are mutually exclusive");
+        }
 
         std::unique_ptr<faiss::Index> index = faiss::read_index_up(argv[1]);
         auto* hnsw_index = dynamic_cast<faiss::IndexHNSW*>(index.get());
@@ -351,6 +529,23 @@ int main(int argc, char** argv) {
         }
 
         FvecsData queries = read_all_fvecs(argv[2]);
+        PrefetchReplayFile replay_file;
+        if (replay_enabled) {
+            replay_file = read_prefetch_replay(prefetch_replay_path);
+            if (replay_file.query_count != queries.count ||
+                replay_file.k != k || replay_file.ef_search != ef_search) {
+                throw std::runtime_error(
+                        "prefetch replay metadata does not match query run");
+            }
+        }
+        PrefetchReplayFile recorded_replay;
+        if (record_enabled) {
+            recorded_replay.query_count = queries.count;
+            recorded_replay.k = k;
+            recorded_replay.ef_search = ef_search;
+            recorded_replay.threshold = onnx_threshold;
+            recorded_replay.queries.resize(queries.count);
+        }
         if (queries.dimension != index->d) {
             throw std::runtime_error("query dimension does not match index");
         }
@@ -359,7 +554,12 @@ int main(int argc, char** argv) {
         }
 
         const auto feature_started = std::chrono::steady_clock::now();
-        hnsw_index->compute_level0_avg_neighbor_distance();
+        if (avg_neighbor_distance_path.empty()) {
+            hnsw_index->compute_level0_avg_neighbor_distance();
+        } else {
+            hnsw_index->read_level0_avg_neighbor_distance(
+                    avg_neighbor_distance_path);
+        }
         const double feature_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - feature_started)
                                                .count();
@@ -386,18 +586,21 @@ int main(int argc, char** argv) {
         std::unique_ptr<faiss::HNSWOnnxModel> onnx_model;
         if (onnx_enabled) {
             onnx_model = std::make_unique<faiss::HNSWOnnxModel>(
-                    onnx_model_path);
+                    onnx_model_path,
+                    onnx_provider,
+                    static_cast<int>(onnx_device_id));
             params.onnx_model = onnx_model.get();
             params.onnx_threshold = onnx_threshold;
         }
 
         std::vector<faiss::idx_t> oracle_final_ids;
         double oracle_precompute_seconds = 0.0;
-        if (oracle_prefetch) {
-            // ORACLE EVALUATION ONLY: run the same deterministic HNSW search
-            // once without ONNX or raw I/O to obtain ground-truth final top-k
-            // IDs. This precomputation is outside all reported query latency.
-            oracle_final_ids.resize(
+        double warmup_search_seconds = 0.0;
+        if (oracle_prefetch || warmup_search) {
+            // Run the same HNSW search once without ONNX or raw I/O. Oracle
+            // mode retains the IDs as ground truth; --warmup-search discards
+            // them so baseline and oracle begin from the same warm-cache state.
+            std::vector<faiss::idx_t> warmup_ids(
                     static_cast<std::uint64_t>(queries.count) * k);
             std::vector<float> oracle_distances(
                     static_cast<std::uint64_t>(queries.count) * k);
@@ -411,14 +614,18 @@ int main(int argc, char** argv) {
                     queries.vectors.data(),
                     k,
                     oracle_distances.data(),
-                    oracle_final_ids.data(),
+                    warmup_ids.data(),
                     &oracle_params);
-            oracle_precompute_seconds = std::chrono::duration<double>(
-                                                std::chrono::steady_clock::now() -
-                                                oracle_started)
-                                                .count();
-            params.oracle_prefetch = true;
-            params.oracle_k = k;
+            warmup_search_seconds = std::chrono::duration<double>(
+                                            std::chrono::steady_clock::now() -
+                                            oracle_started)
+                                            .count();
+            if (oracle_prefetch) {
+                oracle_final_ids = std::move(warmup_ids);
+                oracle_precompute_seconds = warmup_search_seconds;
+                params.oracle_prefetch = true;
+                params.oracle_k = k;
+            }
         }
         std::unique_ptr<faiss::HNSWRawDataPrefetcher> raw_data_prefetcher;
         if (raw_io_enabled) {
@@ -452,6 +659,11 @@ int main(int argc, char** argv) {
                         static_cast<std::uint64_t>(first) * k;
                 params.oracle_query_count = count;
             }
+            if (replay_enabled) {
+                params.prefetch_replay_queries =
+                        replay_file.queries.data() + first;
+                params.prefetch_replay_query_count = count;
+            }
 
             index->search(
                     count,
@@ -469,6 +681,27 @@ int main(int argc, char** argv) {
             for (std::uint32_t local = 0; local < count; ++local) {
                 const std::uint32_t query_id = first + local;
                 const faiss::HNSWQueryTrace& trace = collector.queries[local];
+                if (record_enabled) {
+                    auto& destination =
+                            recorded_replay.queries[query_id].timestep_node_ids;
+                    destination.reserve(trace.timesteps.size());
+                    for (const auto& timestep : trace.timesteps) {
+                        if (timestep.prefetch_decisions.size() != k) {
+                            throw std::runtime_error(
+                                    "cannot record incomplete model decision "
+                                    "for query " +
+                                    std::to_string(query_id));
+                        }
+                        std::vector<std::int32_t> node_ids;
+                        for (std::uint32_t rank = 0; rank < k; ++rank) {
+                            if (timestep.prefetch_decisions[rank] &&
+                                timestep.node_ids[rank] >= 0) {
+                                node_ids.push_back(timestep.node_ids[rank]);
+                            }
+                        }
+                        destination.push_back(std::move(node_ids));
+                    }
+                }
                 if (onnx_enabled) {
                     for (const auto& timestep : trace.timesteps) {
                         if (timestep.prediction_probabilities.size() != k ||
@@ -532,6 +765,9 @@ int main(int argc, char** argv) {
         if (raw_data_prefetcher) {
             raw_data_prefetcher->drain();
         }
+        if (record_enabled) {
+            write_prefetch_replay(prefetch_record_path, recorded_replay);
+        }
 
         const double search_seconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - search_started)
@@ -542,6 +778,10 @@ int main(int argc, char** argv) {
                   << " efSearch=" << ef_search << '\n'
                   << "avg_neighbor_distance_seconds=" << feature_seconds
                   << '\n'
+                  << "avg_neighbor_distance_source="
+                  << (avg_neighbor_distance_path.empty() ? "computed"
+                                                         : "loaded")
+                  << '\n'
                   << "search_and_write_seconds=" << search_seconds << '\n'
                   << "timesteps=" << total_stats.timesteps << '\n'
                   << "labels=" << total_stats.labels << '\n'
@@ -549,12 +789,23 @@ int main(int argc, char** argv) {
                   << "negative_labels="
                   << (total_stats.labels - total_stats.positives) << '\n'
                   << "onnx_enabled=" << onnx_enabled << '\n'
+                  << "onnx_provider="
+                  << (onnx_model ? onnx_model->provider() : "none") << '\n'
+                  << "onnx_device_id="
+                  << (onnx_model ? onnx_model->device_id() : -1) << '\n'
                   << "onnx_threshold=" << onnx_threshold << '\n'
                   << "oracle_prefetch=" << oracle_prefetch << '\n'
+                  << "warmup_search="
+                  << (oracle_prefetch || warmup_search) << '\n'
+                  << "warmup_search_seconds=" << warmup_search_seconds << '\n'
                   << "oracle_precompute_seconds="
                   << oracle_precompute_seconds << '\n'
                   << "prediction_timesteps=" << prediction_timesteps << '\n'
                   << "prefetch_decisions=" << prefetch_decisions << '\n'
+                  << "prefetch_record_enabled=" << record_enabled << '\n'
+                  << "prefetch_record_path=" << prefetch_record_path << '\n'
+                  << "prefetch_replay_enabled=" << replay_enabled << '\n'
+                  << "prefetch_replay_path=" << prefetch_replay_path << '\n'
                   << "trace_path=" << argv[3] << '\n'
                   << "index_path=" << argv[4] << '\n';
         if (raw_data_prefetcher) {

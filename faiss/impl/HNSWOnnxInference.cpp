@@ -9,8 +9,11 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 #include <faiss/impl/FaissAssert.h>
@@ -30,11 +33,55 @@ Ort::Env& onnx_environment() {
     return environment;
 }
 
-Ort::SessionOptions make_session_options() {
+bool contains_provider(
+        const std::vector<std::string>& providers,
+        const std::string& provider) {
+    return std::find(providers.begin(), providers.end(), provider) !=
+            providers.end();
+}
+
+std::string normalize_provider(std::string provider) {
+    std::transform(
+            provider.begin(),
+            provider.end(),
+            provider.begin(),
+            [](unsigned char character) { return std::tolower(character); });
+    if (provider == "gpu") {
+        provider = "cuda";
+    }
+    FAISS_THROW_IF_NOT_FMT(
+            provider == "cpu" || provider == "cuda",
+            "ONNX provider must be cpu, cuda, or gpu; got %s",
+            provider.c_str());
+    return provider;
+}
+
+Ort::SessionOptions make_session_options(
+        const std::string& provider,
+        int device_id) {
+    FAISS_THROW_IF_NOT_FMT(
+            device_id >= 0,
+            "ONNX device ID must be non-negative, got %d",
+            device_id);
     Ort::SessionOptions options;
     options.SetIntraOpNumThreads(1);
     options.SetInterOpNumThreads(1);
     options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
+    if (provider == "cuda") {
+        const std::vector<std::string> available = Ort::GetAvailableProviders();
+        FAISS_THROW_IF_NOT_MSG(
+                contains_provider(available, "CUDAExecutionProvider"),
+                "CUDAExecutionProvider is not available in this ONNX Runtime");
+        Ort::CUDAProviderOptions cuda_options;
+        cuda_options.Update({
+                {"device_id", std::to_string(device_id)},
+                {"do_copy_in_default_stream", "1"},
+        });
+        options.AppendExecutionProvider_CUDA_V2(*cuda_options);
+        // A requested GPU run must not silently move unsupported model nodes
+        // to CPU. Host/device copy nodes inserted by ORT remain permitted.
+        options.AddConfigEntry("session.disable_cpu_ep_fallback", "1");
+    }
     return options;
 }
 
@@ -66,10 +113,13 @@ void require_shape(
 
 struct HNSWOnnxModel::Impl {
     std::string path;
+    std::string provider;
+    int device_id = 0;
     // ONNX Runtime permits concurrent Run calls on one session, but its C++
     // wrapper exposes Run as non-const.
     mutable Ort::Session session;
     Ort::MemoryInfo memory_info;
+    std::unique_ptr<Ort::MemoryInfo> gpu_memory_info;
     std::array<int64_t, 3> feature_shape{};
     std::array<int64_t, 3> state_shape{};
     int topk = 0;
@@ -77,15 +127,27 @@ struct HNSWOnnxModel::Impl {
     int num_layers = 0;
     int hidden_size = 0;
 
-    explicit Impl(const std::string& model_path)
+    explicit Impl(
+            const std::string& model_path,
+            const std::string& provider_name,
+            int requested_device_id)
             : path(model_path),
+              provider(normalize_provider(provider_name)),
+              device_id(requested_device_id),
               session(
                       onnx_environment(),
                       model_path.c_str(),
-                      make_session_options()),
+                      make_session_options(provider, device_id)),
               memory_info(Ort::MemoryInfo::CreateCpu(
                       OrtArenaAllocator,
                       OrtMemTypeDefault)) {
+        if (provider == "cuda") {
+            gpu_memory_info = std::make_unique<Ort::MemoryInfo>(
+                    "Cuda",
+                    OrtDeviceAllocator,
+                    device_id,
+                    OrtMemTypeDefault);
+        }
         FAISS_THROW_IF_NOT_FMT(
                 session.GetInputCount() == 3,
                 "HNSW ONNX model must have 3 inputs, got %zu",
@@ -124,6 +186,11 @@ struct HNSWOnnxQuery::Impl {
     const HNSWOnnxModel::Impl& model;
     std::vector<float> hidden;
     std::vector<float> cell;
+    std::unique_ptr<Ort::Allocator> gpu_allocator;
+    std::vector<Ort::Value> hidden_gpu;
+    std::vector<Ort::Value> cell_gpu;
+    size_t current_gpu_state = 0;
+    bool has_gpu_state = false;
 
     explicit Impl(const HNSWOnnxModel::Impl& model_in)
             : model(model_in),
@@ -131,11 +198,31 @@ struct HNSWOnnxQuery::Impl {
                       static_cast<size_t>(model.num_layers) *
                               model.hidden_size,
                       0.0f),
-              cell(hidden.size(), 0.0f) {}
+              cell(hidden.size(), 0.0f) {
+        if (model.provider == "cuda") {
+            gpu_allocator = std::make_unique<Ort::Allocator>(
+                    model.session, *model.gpu_memory_info);
+            hidden_gpu.reserve(2);
+            cell_gpu.reserve(2);
+            for (size_t buffer = 0; buffer < 2; ++buffer) {
+                hidden_gpu.emplace_back(Ort::Value::CreateTensor<float>(
+                        *gpu_allocator,
+                        model.state_shape.data(),
+                        model.state_shape.size()));
+                cell_gpu.emplace_back(Ort::Value::CreateTensor<float>(
+                        *gpu_allocator,
+                        model.state_shape.data(),
+                        model.state_shape.size()));
+            }
+        }
+    }
 };
 
-HNSWOnnxModel::HNSWOnnxModel(const std::string& model_path)
-        : impl_(std::make_unique<Impl>(model_path)) {}
+HNSWOnnxModel::HNSWOnnxModel(
+        const std::string& model_path,
+        const std::string& provider,
+        int device_id)
+        : impl_(std::make_unique<Impl>(model_path, provider, device_id)) {}
 
 HNSWOnnxModel::~HNSWOnnxModel() = default;
 HNSWOnnxModel::HNSWOnnxModel(HNSWOnnxModel&&) noexcept = default;
@@ -159,6 +246,14 @@ int HNSWOnnxModel::hidden_size() const {
 
 const std::string& HNSWOnnxModel::model_path() const {
     return impl_->path;
+}
+
+const std::string& HNSWOnnxModel::provider() const {
+    return impl_->provider;
+}
+
+int HNSWOnnxModel::device_id() const {
+    return impl_->device_id;
 }
 
 std::unique_ptr<HNSWOnnxQuery> HNSWOnnxModel::create_query() const {
@@ -194,6 +289,53 @@ std::vector<float> HNSWOnnxQuery::predict(
             feature_count,
             model.feature_shape.data(),
             model.feature_shape.size());
+    if (model.provider == "cuda") {
+        std::vector<float> probabilities(static_cast<size_t>(model.topk));
+        Ort::Value probability_tensor = Ort::Value::CreateTensor<float>(
+                model.memory_info,
+                probabilities.data(),
+                probabilities.size(),
+                model.feature_shape.data(),
+                2);
+        Ort::Value initial_hidden = Ort::Value::CreateTensor<float>(
+                model.memory_info,
+                impl_->hidden.data(),
+                impl_->hidden.size(),
+                model.state_shape.data(),
+                model.state_shape.size());
+        Ort::Value initial_cell = Ort::Value::CreateTensor<float>(
+                model.memory_info,
+                impl_->cell.data(),
+                impl_->cell.size(),
+                model.state_shape.data(),
+                model.state_shape.size());
+
+        const size_t next_state = impl_->has_gpu_state
+                ? 1 - impl_->current_gpu_state
+                : 0;
+        Ort::IoBinding binding(model.session);
+        binding.BindInput("features", feature_tensor);
+        binding.BindInput(
+                "hidden_in",
+                impl_->has_gpu_state
+                        ? impl_->hidden_gpu[impl_->current_gpu_state]
+                        : initial_hidden);
+        binding.BindInput(
+                "cell_in",
+                impl_->has_gpu_state
+                        ? impl_->cell_gpu[impl_->current_gpu_state]
+                        : initial_cell);
+        binding.BindOutput("probabilities", probability_tensor);
+        binding.BindOutput("hidden_out", impl_->hidden_gpu[next_state]);
+        binding.BindOutput("cell_out", impl_->cell_gpu[next_state]);
+        model.session.Run(Ort::RunOptions{nullptr}, binding);
+        binding.SynchronizeOutputs();
+
+        impl_->current_gpu_state = next_state;
+        impl_->has_gpu_state = true;
+        return probabilities;
+    }
+
     Ort::Value hidden_tensor = Ort::Value::CreateTensor<float>(
             model.memory_info,
             impl_->hidden.data(),
@@ -254,7 +396,7 @@ std::vector<float> HNSWOnnxQuery::predict(
 struct HNSWOnnxModel::Impl {};
 struct HNSWOnnxQuery::Impl {};
 
-HNSWOnnxModel::HNSWOnnxModel(const std::string&) {
+HNSWOnnxModel::HNSWOnnxModel(const std::string&, const std::string&, int) {
     FAISS_THROW_MSG(
             "Faiss was built without ONNX Runtime; configure with "
             "FAISS_ENABLE_ONNX_RUNTIME=ON");
@@ -277,6 +419,13 @@ int HNSWOnnxModel::hidden_size() const {
 const std::string& HNSWOnnxModel::model_path() const {
     static const std::string empty;
     return empty;
+}
+const std::string& HNSWOnnxModel::provider() const {
+    static const std::string empty;
+    return empty;
+}
+int HNSWOnnxModel::device_id() const {
+    return -1;
 }
 std::unique_ptr<HNSWOnnxQuery> HNSWOnnxModel::create_query() const {
     FAISS_THROW_MSG("Faiss was built without ONNX Runtime");

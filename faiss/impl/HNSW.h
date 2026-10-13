@@ -104,6 +104,15 @@ struct HNSWFeatureCollector {
     std::vector<HNSWQueryTrace> queries;
 };
 
+/** Predicted node IDs to submit at each HNSW timestep.
+ *
+ * This is an evaluation-only replay format: decisions are recorded by an
+ * earlier model run and then replayed without executing the model.
+ */
+struct HNSWPrefetchReplayQuery {
+    std::vector<std::vector<int32_t>> timestep_node_ids;
+};
+
 struct SearchParametersHNSW : SearchParameters {
     int efSearch = 16;
     bool check_relative_distance = true;
@@ -118,19 +127,18 @@ struct SearchParametersHNSW : SearchParameters {
     /// The caller owns this object and must keep it alive through search().
     HNSWRawDataPrefetcher* raw_data_prefetcher = nullptr;
     bool prefetch_enabled = false;
-    /** ORACLE EVALUATION ONLY.
-     *
-     * When enabled, model inference and threshold decisions still run, but a
-     * predicted node is submitted for I/O only if it belongs to the known
-     * final top-k supplied below. This is not deployable online behavior; it
-     * exists solely to measure the latency cost caused by false-positive I/O.
-     * `oracle_final_ids` contains `oracle_query_count * oracle_k` row-major
-     * IDs for the current search() call.
-     */
+    /** IDEAL ORACLE EVALUATION ONLY. */
     bool oracle_prefetch = false;
     const idx_t* oracle_final_ids = nullptr;
     size_t oracle_query_count = 0;
     size_t oracle_k = 0;
+    /** MODEL-ZERO-COST EVALUATION ONLY.
+     *
+     * Replays node IDs predicted by a prior model run at the corresponding
+     * search timestep. No ONNX session is created or executed.
+     */
+    const HNSWPrefetchReplayQuery* prefetch_replay_queries = nullptr;
+    size_t prefetch_replay_query_count = 0;
 
     ~SearchParametersHNSW() {}
 };
