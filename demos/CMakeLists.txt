@@ -30,6 +30,12 @@ target_link_libraries(precompute_hnsw_avg_neighbor_distance PRIVATE faiss)
 add_executable(validate_hnsw_onnx_providers EXCLUDE_FROM_ALL validate_hnsw_onnx_providers.cpp)
 target_link_libraries(validate_hnsw_onnx_providers PRIVATE faiss)
 
+add_executable(validate_hnsw_cuda_pipeline EXCLUDE_FROM_ALL validate_hnsw_cuda_pipeline.cpp)
+target_link_libraries(validate_hnsw_cuda_pipeline PRIVATE faiss)
+
+add_executable(profile_hnsw_single_query EXCLUDE_FROM_ALL profile_hnsw_single_query.cpp)
+target_link_libraries(profile_hnsw_single_query PRIVATE faiss)
+
 add_executable(demo_weighted_kmeans EXCLUDE_FROM_ALL demo_weighted_kmeans.cpp)
 target_link_libraries(demo_weighted_kmeans PRIVATE faiss)
 

@@ -81,7 +81,7 @@ def load_oracle_summary(path: Path) -> dict[int, dict[str, float]]:
 
 def load_paired_summary(
     path: Path,
-) -> tuple[dict[int, dict[str, dict[str, float]]], str]:
+) -> tuple[dict[int, dict[str, dict[str, float]]], tuple[str, ...]]:
     with path.open("r", encoding="utf-8", newline="") as handle:
         rows = list(csv.DictReader(handle, delimiter="\t"))
     values: dict[int, dict[str, dict[str, float]]] = {}
@@ -96,36 +96,40 @@ def load_paired_summary(
     comparison_modes = {
         mode for topk_values in values.values() for mode in topk_values
     } - {"baseline"}
-    if len(comparison_modes) != 1:
-        raise ValueError(f"{path} must contain one paired comparison mode")
-    comparison_mode = next(iter(comparison_modes))
-    expected_modes = {"baseline", comparison_mode}
+    if not comparison_modes:
+        raise ValueError(f"{path} must contain at least one comparison mode")
+    expected_modes = {"baseline", *comparison_modes}
     if set(values) != {10, 20, 50} or any(
         set(values[topk]) != expected_modes for topk in values
     ):
         raise ValueError(
-            f"{path} must contain baseline/{comparison_mode} rows for "
-            "k=10, 20, and 50"
+            f"{path} must contain the same modes for k=10, 20, and 50"
         )
-    return values, comparison_mode
+    priority = {"replay": 0, "async": 1, "oracle": 2}
+    ordered_modes = tuple(
+        sorted(comparison_modes, key=lambda mode: (priority.get(mode, 99), mode))
+    )
+    return values, ordered_modes
 
 
 def main() -> None:
     args = parse_args()
     topks = (10, 20, 50)
     if args.paired_summary:
-        values, comparison_mode = load_paired_summary(args.paired_summary)
-        modes = ("baseline", comparison_mode)
+        values, comparison_modes = load_paired_summary(args.paired_summary)
+        modes = ("baseline", *comparison_modes)
         comparison_labels = {
             "oracle": "Oracle",
             "replay": "LSTM replay\n(0 inference cost)",
+            "async": "Async LSTM\nprefetch",
         }
-        labels = {
-            "baseline": "Baseline",
-            comparison_mode: comparison_labels.get(
-                comparison_mode, comparison_mode.capitalize()
-            ),
-        }
+        labels = {"baseline": "Baseline"}
+        labels.update(
+            {
+                mode: comparison_labels.get(mode, mode.capitalize())
+                for mode in comparison_modes
+            }
+        )
     else:
         summary_paths = {
             topk: getattr(args, f"summary_k{topk}") for topk in topks
@@ -164,7 +168,10 @@ def main() -> None:
     }
     bar_width = 0.78
 
-    fig, ax = plt.subplots(figsize=(14, 8))
+    fig, ax = plt.subplots(figsize=(16 if len(modes) >= 3 else 14, 8))
+    search_legend = (
+        "Search/inference phase" if "async" in modes else "HNSW search"
+    )
     tick_positions: list[float] = []
     tick_labels: list[str] = []
     for topk in topks:
@@ -179,7 +186,7 @@ def main() -> None:
                 width=bar_width,
                 color=colors["search"],
                 label=(
-                    "HNSW search"
+                    search_legend
                     if args.exclude_prefetch or args.paired_summary
                     else "HNSW search (+ inference for Prefetch)"
                 )
@@ -220,14 +227,14 @@ def main() -> None:
                 )
             else:
                 ax.annotate(
-                    f"I/O wait {wait:.3f} ms",
+                    f"{wait:.3f} ms",
                     xy=(position, total),
                     xytext=(0, 19),
                     textcoords="offset points",
                     ha="center",
                     va="bottom",
                     color=colors["wait"],
-                    fontsize=9,
+                    fontsize=8,
                     fontweight="bold",
                     arrowprops={
                         "arrowstyle": "-",
@@ -242,7 +249,7 @@ def main() -> None:
                 textcoords="offset points",
                 ha="center",
                 va="bottom",
-                fontsize=10,
+                fontsize=9,
                 fontweight="bold",
             )
             tick_positions.append(position)

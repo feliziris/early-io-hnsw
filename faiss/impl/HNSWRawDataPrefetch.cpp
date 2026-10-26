@@ -6,6 +6,7 @@
  */
 
 #include <faiss/impl/HNSWRawDataPrefetch.h>
+#include <faiss/impl/HNSWSearchProfile.h>
 
 #include <algorithm>
 #include <atomic>
@@ -302,6 +303,7 @@ struct HNSWRawDataQuery::Impl {
     Clock::time_point search_started = Clock::now();
     std::unordered_map<int32_t, std::shared_ptr<ReadRequest>> requests;
     bool finished = false;
+    HNSWSearchProfile* profile = nullptr;
 
     Impl(HNSWRawDataPrefetcher::Impl& input_owner, bool enabled)
             : owner(input_owner), prefetch_enabled(enabled) {}
@@ -323,7 +325,7 @@ HNSWRawDataPrefetcher::HNSWRawDataPrefetcher(
 HNSWRawDataPrefetcher::~HNSWRawDataPrefetcher() = default;
 
 std::unique_ptr<HNSWRawDataQuery> HNSWRawDataPrefetcher::create_query(
-        bool prefetch_enabled) {
+        bool prefetch_enabled, HNSWSearchProfile* profile) {
     {
         std::lock_guard<std::mutex> lock(impl_->stats_mutex);
         if (impl_->prefetch_mode_initialized &&
@@ -334,9 +336,16 @@ std::unique_ptr<HNSWRawDataQuery> HNSWRawDataPrefetcher::create_query(
         impl_->prefetch_enabled = prefetch_enabled;
         impl_->prefetch_mode_initialized = true;
     }
-    return std::unique_ptr<HNSWRawDataQuery>(new HNSWRawDataQuery(
-            std::make_unique<HNSWRawDataQuery::Impl>(
-                    *impl_, prefetch_enabled)));
+    auto state = std::make_unique<HNSWRawDataQuery::Impl>(
+            *impl_, prefetch_enabled);
+    state->profile = profile;
+    if (profile) {
+        profile->start_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+                                    state->search_started.time_since_epoch())
+                                    .count();
+    }
+    return std::unique_ptr<HNSWRawDataQuery>(
+            new HNSWRawDataQuery(std::move(state)));
 }
 
 void HNSWRawDataPrefetcher::drain() {
@@ -390,6 +399,10 @@ void HNSWRawDataQuery::finish(const std::vector<int32_t>& final_ids) {
     }
     impl_->finished = true;
     const Clock::time_point search_ended = Clock::now();
+    if (impl_->profile) {
+        impl_->profile->search_end_ms =
+                elapsed_ns(impl_->search_started, search_ended) / 1e6;
+    }
     const Clock::time_point data_wait_started = search_ended;
     uint64_t tp = 0;
     uint64_t fn = 0;
@@ -405,10 +418,18 @@ void HNSWRawDataQuery::finish(const std::vector<int32_t>& final_ids) {
             ++fn;
         }
     }
+    if (impl_->profile) {
+        impl_->profile->requests_submitted_ms =
+                elapsed_ns(impl_->search_started, Clock::now()) / 1e6;
+    }
     for (const auto& request : final_requests) {
         request->wait();
     }
     const Clock::time_point data_ready = Clock::now();
+    if (impl_->profile) {
+        impl_->profile->data_ready_ms =
+                elapsed_ns(impl_->search_started, data_ready) / 1e6;
+    }
     const uint64_t fp = impl_->prefetch_enabled
             ? impl_->requests.size() - tp
             : 0;

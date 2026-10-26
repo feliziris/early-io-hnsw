@@ -11,7 +11,14 @@
 #include <array>
 #include <cinttypes>
 #include <cstddef>
+#include <chrono>
 #include <cstdlib>
+#include <condition_variable>
+#include <deque>
+#include <exception>
+#include <future>
+#include <mutex>
+#include <thread>
 #include <type_traits>
 #include <unordered_set>
 
@@ -1236,6 +1243,355 @@ void collect_final_top_k(ResultHandler& res, HNSWQueryTrace& trace) {
     }
 }
 
+/** Persistent executor owned by the calling search thread. Queries on the
+ * same search thread reuse its inference worker, including across search()
+ * calls. Concurrent OpenMP search threads each have a separate executor.
+ * Jobs must finish before their query-owned data is destroyed.
+ */
+int64_t profile_now_ns() {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(
+                   std::chrono::steady_clock::now().time_since_epoch())
+            .count();
+}
+
+double profile_elapsed_ms(const HNSWSearchProfile* profile) {
+    return (profile_now_ns() - profile->start_ns) / 1e6;
+}
+
+class HNSWAsyncOnnxWorker {
+   public:
+    HNSWAsyncOnnxWorker() : worker_([this] { run(); }) {
+        // Do not start query latency accounting until the OS thread has
+        // actually entered run(), including on the first async query.
+        std::unique_lock<std::mutex> lock(mutex_);
+        ready_.wait(lock, [&] { return started_; });
+    }
+
+    ~HNSWAsyncOnnxWorker() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            stopping_ = true;
+        }
+        ready_.notify_one();
+        worker_.join();
+    }
+
+    std::future<void> submit(std::packaged_task<void()> job) {
+        auto completion = job.get_future();
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            jobs_.push_back(std::move(job));
+        }
+        ready_.notify_one();
+        return completion;
+    }
+
+   private:
+    void run() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            started_ = true;
+        }
+        ready_.notify_one();
+        while (true) {
+            std::packaged_task<void()> job;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait(lock, [&] { return stopping_ || !jobs_.empty(); });
+                if (jobs_.empty() && stopping_) {
+                    return;
+                }
+                job = std::move(jobs_.front());
+                jobs_.pop_front();
+            }
+            job();
+        }
+    }
+
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<std::packaged_task<void()>> jobs_;
+    bool stopping_ = false;
+    bool started_ = false;
+    // Start only after all state used by run() has been constructed.
+    std::thread worker_;
+};
+
+HNSWAsyncOnnxWorker& async_onnx_worker() {
+    thread_local HNSWAsyncOnnxWorker worker;
+    return worker;
+}
+
+/** Asynchronous inference pipeline for one query.
+ *
+ * The HNSW thread deep-copies each observable result-queue snapshot into a
+ * FIFO. A reusable worker processes the recurrent HNSWOnnxQuery, preserving
+ * LSTM state order, and submits predicted raw-data reads as soon as each
+ * prediction completes. finish() waits for this query's job before
+ * HNSWRawDataQuery::finish(), so its non-thread-safe per-query request map is
+ * never accessed concurrently with final-result accounting.
+ */
+class HNSWAsyncOnnxQuery {
+   public:
+    HNSWAsyncOnnxQuery(
+            std::unique_ptr<HNSWOnnxQuery> query,
+            float threshold,
+            HNSWRawDataQuery* raw_data_query,
+            HNSWSearchProfile* profile)
+            : query_(std::move(query)),
+              threshold_(threshold),
+              raw_data_query_(raw_data_query),
+              profile_(profile) {
+        completion_ = async_onnx_worker().submit(
+                std::packaged_task<void()>([this] { run(); }));
+    }
+
+    ~HNSWAsyncOnnxQuery() {
+        close_and_wait();
+    }
+
+    void enqueue(size_t timestep_index, const HNSWFeatureTimestep& timestep) {
+        Task task;
+        task.timestep_index = timestep_index;
+        task.node_ids = timestep.node_ids;
+        task.features = timestep.features;
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            FAISS_THROW_IF_NOT_MSG(!closed_, "async ONNX queue is closed");
+            if (profile_) {
+                task.enqueued_ms = profile_elapsed_ms(profile_);
+                profile_->peak_snapshot_queue = std::max(
+                        profile_->peak_snapshot_queue, tasks_.size() + 1);
+            }
+            tasks_.push_back(std::move(task));
+        }
+        ready_.notify_one();
+    }
+
+    void finish(HNSWQueryTrace& trace) {
+        close_and_wait();
+        if (error_) {
+            std::rethrow_exception(error_);
+        }
+        FAISS_THROW_IF_NOT_FMT(
+                completed_.size() == trace.timesteps.size(),
+                "async ONNX completed %zu of %zu timesteps",
+                completed_.size(),
+                trace.timesteps.size());
+        for (Result& result : completed_) {
+            FAISS_THROW_IF_NOT_FMT(
+                    result.timestep_index < trace.timesteps.size(),
+                    "async ONNX result timestep %zu is out of range",
+                    result.timestep_index);
+            HNSWFeatureTimestep& timestep =
+                    trace.timesteps[result.timestep_index];
+            timestep.prediction_probabilities =
+                    std::move(result.probabilities);
+            timestep.prefetch_decisions = std::move(result.decisions);
+        }
+        trace.gpu_pipeline_submitted = gpu_submitted_;
+        trace.gpu_pipeline_peak_inflight = gpu_peak_inflight_;
+    }
+
+   private:
+    struct Task {
+        size_t timestep_index = 0;
+        double enqueued_ms = 0;
+        std::vector<int32_t> node_ids;
+        std::vector<float> features;
+    };
+
+    struct Result {
+        size_t timestep_index = 0;
+        std::vector<float> probabilities;
+        std::vector<uint8_t> decisions;
+    };
+
+    void close_and_wait() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            closed_ = true;
+        }
+        ready_.notify_one();
+        if (completion_.valid()) {
+            completion_.wait();
+        }
+    }
+
+    void run() noexcept {
+        try {
+            if (query_->gpu_pipeline_depth()) {
+                run_gpu_pipeline();
+                return;
+            }
+            while (true) {
+                Task task;
+                {
+                    std::unique_lock<std::mutex> lock(mutex_);
+                    ready_.wait(lock, [&] { return closed_ || !tasks_.empty(); });
+                    if (tasks_.empty()) {
+                        if (closed_) {
+                            break;
+                        }
+                        continue;
+                    }
+                    task = std::move(tasks_.front());
+                    tasks_.pop_front();
+                }
+
+                Result result;
+                result.timestep_index = task.timestep_index;
+                HNSWInferenceProfileEvent event;
+                if (profile_) {
+                    event.timestep = task.timestep_index;
+                    event.enqueued_ms = task.enqueued_ms;
+                    event.started_ms = profile_elapsed_ms(profile_);
+                }
+                result.probabilities = query_->predict(
+                        task.features.data(), task.features.size(),
+                        profile_ ? &event.predict : nullptr);
+                if (profile_) {
+                    event.predicted_ms = profile_elapsed_ms(profile_);
+                }
+                result.decisions.resize(result.probabilities.size());
+                for (size_t rank = 0; rank < result.probabilities.size();
+                     ++rank) {
+                    result.decisions[rank] = static_cast<uint8_t>(
+                            result.probabilities[rank] >= threshold_);
+                    if (raw_data_query_ && result.decisions[rank] &&
+                        task.node_ids[rank] >= 0) {
+                        raw_data_query_->submit(task.node_ids[rank]);
+                    }
+                }
+                if (profile_) {
+                    event.submitted_ms = profile_elapsed_ms(profile_);
+                    profile_->predict_ms += event.predicted_ms - event.started_ms;
+                    profile_->io_submit_ms += event.submitted_ms - event.predicted_ms;
+                    profile_->inference_events.push_back(event);
+                }
+                completed_.push_back(std::move(result));
+            }
+        } catch (...) {
+            error_ = std::current_exception();
+        }
+    }
+
+    void run_gpu_pipeline() {
+        struct Pending {
+            Task snapshot;
+            HNSWInferenceProfileEvent event;
+        };
+        std::deque<Pending> pending;
+        auto complete = [&](std::vector<float> probabilities) {
+            Task snapshot = std::move(pending.front().snapshot);
+            HNSWInferenceProfileEvent event = pending.front().event;
+            pending.pop_front();
+            Result result;
+            result.timestep_index = snapshot.timestep_index;
+            result.probabilities = std::move(probabilities);
+            result.decisions.resize(result.probabilities.size());
+            for (size_t rank = 0; rank < result.probabilities.size(); ++rank) {
+                result.decisions[rank] = static_cast<uint8_t>(
+                        result.probabilities[rank] >= threshold_);
+                if (raw_data_query_ && result.decisions[rank] &&
+                    snapshot.node_ids[rank] >= 0) {
+                    raw_data_query_->submit(snapshot.node_ids[rank]);
+                }
+            }
+            if (profile_) {
+                event.submitted_ms = profile_elapsed_ms(profile_);
+                profile_->predict_ms += event.gpu_enqueued_ms - event.started_ms +
+                        event.predicted_ms - event.collect_started_ms;
+                profile_->io_submit_ms += event.submitted_ms - event.predicted_ms;
+                profile_->inference_events.push_back(event);
+            }
+            completed_.push_back(std::move(result));
+        };
+        auto collect = [&](std::vector<float>& probabilities, bool wait) {
+            auto& event = pending.front().event;
+            const double started = profile_ ? profile_elapsed_ms(profile_) : 0;
+            const bool ready = query_->collect_gpu(
+                    probabilities, wait, profile_ ? &event.predict : nullptr);
+            if (profile_ && ready) {
+                event.collect_started_ms = started;
+                event.predicted_ms = profile_elapsed_ms(profile_);
+            }
+            return ready;
+        };
+        while (true) {
+            // Reap a ready result before submitting more work so prefetch
+            // decisions are not held until every GPU request has completed.
+            std::vector<float> probabilities;
+            if (!pending.empty() && collect(probabilities, false)) {
+                complete(std::move(probabilities));
+                continue;
+            }
+            Task task;
+            bool have_task = false;
+            bool closed_and_empty = false;
+            {
+                std::unique_lock<std::mutex> lock(mutex_);
+                if (pending.empty()) {
+                    ready_.wait(lock, [&] { return closed_ || !tasks_.empty(); });
+                }
+                if (!tasks_.empty() &&
+                    pending.size() < query_->gpu_pipeline_depth()) {
+                    task = std::move(tasks_.front());
+                    tasks_.pop_front();
+                    have_task = true;
+                }
+                closed_and_empty = closed_ && tasks_.empty();
+            }
+            if (have_task) {
+                HNSWInferenceProfileEvent event;
+                if (profile_) {
+                    event.timestep = task.timestep_index;
+                    event.enqueued_ms = task.enqueued_ms;
+                    event.started_ms = profile_elapsed_ms(profile_);
+                }
+                query_->submit_gpu(task.features.data(), task.features.size(),
+                                   profile_ ? &event.predict : nullptr);
+                if (profile_) event.gpu_enqueued_ms = profile_elapsed_ms(profile_);
+                pending.push_back({std::move(task), event});
+                ++gpu_submitted_;
+                gpu_peak_inflight_ = std::max(gpu_peak_inflight_, pending.size());
+            } else if (!pending.empty() &&
+                       (pending.size() == query_->gpu_pipeline_depth() ||
+                        closed_and_empty)) {
+                // Wait only for bounded backpressure or final drain. While
+                // the producer is active and slots are available, a new
+                // snapshot must not be blocked behind the oldest GPU result.
+                FAISS_THROW_IF_NOT(collect(probabilities, true));
+                complete(std::move(probabilities));
+            } else if (!pending.empty()) {
+                // CUDA completion events cannot notify this CPU condition
+                // variable. Poll them with a short timed wait, but wake
+                // immediately when search enqueues another snapshot.
+                std::unique_lock<std::mutex> lock(mutex_);
+                ready_.wait_for(lock, std::chrono::microseconds(50), [&] {
+                    return closed_ || !tasks_.empty();
+                });
+            } else if (closed_and_empty) {
+                break;
+            }
+        }
+    }
+
+    std::unique_ptr<HNSWOnnxQuery> query_;
+    float threshold_;
+    HNSWRawDataQuery* raw_data_query_;
+    HNSWSearchProfile* profile_;
+    std::mutex mutex_;
+    std::condition_variable ready_;
+    std::deque<Task> tasks_;
+    bool closed_ = false;
+    std::vector<Result> completed_;
+    std::exception_ptr error_;
+    std::future<void> completion_;
+    size_t gpu_submitted_ = 0;
+    size_t gpu_peak_inflight_ = 0;
+};
+
 /** Templated body of `search_from_candidates` — instantiated once per
  * VisitedTable subclass × comparator.
  */
@@ -1253,6 +1609,7 @@ int search_from_candidates_fixVT(
         const IndexHNSW* index = nullptr,
         HNSWQueryTrace* feature_trace = nullptr,
         HNSWOnnxQuery* onnx_query = nullptr,
+        HNSWAsyncOnnxQuery* async_onnx_query = nullptr,
         float onnx_threshold = 0.5f,
         HNSWRawDataQuery* raw_data_query = nullptr,
         const std::unordered_set<int32_t>* oracle_final_ids = nullptr,
@@ -1264,6 +1621,10 @@ int search_from_candidates_fixVT(
     int efSearch;
     const IDSelector* sel;
     extract_search_params(hnsw, params, do_dis_check, efSearch, sel);
+
+    const auto* profile_params = dynamic_cast<const SearchParametersHNSW*>(params);
+    HNSWSearchProfile* profile =
+            profile_params ? profile_params->search_profile : nullptr;
 
     vt.reserve(efSearch);
 
@@ -1379,6 +1740,7 @@ int search_from_candidates_fixVT(
 
         nstep++;
         if (feature_trace) {
+            const int64_t feature_started = profile ? profile_now_ns() : 0;
             collect_feature_timestep<C>(
                     res,
                     *index,
@@ -1387,6 +1749,9 @@ int search_from_candidates_fixVT(
                     nstep,
                     previous_rank_ids,
                     rank_persistence_counts);
+            if (profile) {
+                profile->feature_ms += (profile_now_ns() - feature_started) / 1e6;
+            }
             if (prefetch_replay && !feature_trace->timesteps.empty()) {
                 const size_t timestep_index = static_cast<size_t>(nstep - 1);
                 // A replay run may execute trailing efSearch-boundary steps
@@ -1415,6 +1780,15 @@ int search_from_candidates_fixVT(
                         oracle_final_ids->count(node_id) != 0) {
                         raw_data_query->submit(node_id);
                     }
+                }
+            } else if (
+                    async_onnx_query && !feature_trace->timesteps.empty()) {
+                const int64_t enqueue_started = profile ? profile_now_ns() : 0;
+                async_onnx_query->enqueue(
+                        feature_trace->timesteps.size() - 1,
+                        feature_trace->timesteps.back());
+                if (profile) {
+                    profile->enqueue_ms += (profile_now_ns() - enqueue_started) / 1e6;
                 }
             } else if (onnx_query && !feature_trace->timesteps.empty()) {
                 HNSWFeatureTimestep& timestep =
@@ -1479,6 +1853,7 @@ int search_from_candidates_dispatch(
         const IndexHNSW* index = nullptr,
         HNSWQueryTrace* feature_trace = nullptr,
         HNSWOnnxQuery* onnx_query = nullptr,
+        HNSWAsyncOnnxQuery* async_onnx_query = nullptr,
         float onnx_threshold = 0.5f,
         HNSWRawDataQuery* raw_data_query = nullptr,
         const std::unordered_set<int32_t>* oracle_final_ids = nullptr,
@@ -1497,6 +1872,7 @@ int search_from_candidates_dispatch(
                 index,
                 feature_trace,
                 onnx_query,
+                async_onnx_query,
                 onnx_threshold,
                 raw_data_query,
                 oracle_final_ids,
@@ -1919,6 +2295,8 @@ HNSWStats search_impl(
     int cur_efSearch = hnsw.efSearch;
     HNSWOnnxModel* onnx_model = nullptr;
     float onnx_threshold = 0.5f;
+    bool onnx_async_inference = false;
+    HNSWSearchProfile* profile = nullptr;
     HNSWRawDataPrefetcher* raw_data_prefetcher = nullptr;
     bool prefetch_enabled = false;
     bool oracle_prefetch = false;
@@ -1932,6 +2310,8 @@ HNSWStats search_impl(
             cur_efSearch = hnsw_params->efSearch;
             onnx_model = hnsw_params->onnx_model;
             onnx_threshold = hnsw_params->onnx_threshold;
+            onnx_async_inference = hnsw_params->onnx_async_inference;
+            profile = hnsw_params->search_profile;
             raw_data_prefetcher = hnsw_params->raw_data_prefetcher;
             prefetch_enabled = hnsw_params->prefetch_enabled;
             oracle_prefetch = hnsw_params->oracle_prefetch;
@@ -1951,6 +2331,9 @@ HNSWStats search_impl(
     FAISS_THROW_IF_NOT_MSG(
             !(onnx_model && prefetch_replay),
             "prefetch replay must not execute an ONNX model");
+    FAISS_THROW_IF_NOT_MSG(
+            !onnx_model || !onnx_model->gpu_pipeline_depth() || onnx_async_inference,
+            "GPU pipeline requires onnx_async_inference=true");
     FAISS_THROW_IF_NOT_MSG(
             !(oracle_prefetch && prefetch_replay),
             "prefetch replay and oracle mode are mutually exclusive");
@@ -1980,10 +2363,19 @@ HNSWStats search_impl(
                     static_cast<int32_t>(oracle_final_ids[rank]));
         }
     }
+    if (onnx_model && onnx_async_inference) {
+        // Create and start the persistent inference thread before
+        // create_query() records search_started. Later queries reuse it.
+        async_onnx_worker();
+    }
     std::unique_ptr<HNSWRawDataQuery> raw_data_query;
+    if (profile) {
+        *profile = HNSWSearchProfile{};
+        profile->start_ns = profile_now_ns();
+    }
     if (raw_data_prefetcher) {
         raw_data_query =
-                raw_data_prefetcher->create_query(prefetch_enabled);
+                raw_data_prefetcher->create_query(prefetch_enabled, profile);
     }
 
     //  greedy search on upper levels
@@ -1996,8 +2388,12 @@ HNSWStats search_impl(
         stats.combine(local_stats);
     }
 
+    if (profile) {
+        profile->upper_end_ms = profile_elapsed_ms(profile);
+    }
     HNSWQueryTrace onnx_only_trace;
     std::unique_ptr<HNSWOnnxQuery> onnx_query;
+    std::unique_ptr<HNSWAsyncOnnxQuery> async_onnx_query;
     if (onnx_model) {
         FAISS_THROW_IF_NOT_MSG(
                 index,
@@ -2028,6 +2424,13 @@ HNSWStats search_impl(
             feature_trace = &onnx_only_trace;
         }
         onnx_query = onnx_model->create_query();
+        if (onnx_async_inference) {
+            async_onnx_query = std::make_unique<HNSWAsyncOnnxQuery>(
+                    std::move(onnx_query),
+                    onnx_threshold,
+                    raw_data_query.get(),
+                    profile);
+        }
     }
 
     if (feature_trace) {
@@ -2048,6 +2451,9 @@ HNSWStats search_impl(
         feature_trace->final_top_k_distances.clear();
     }
 
+    if (profile) {
+        profile->setup_end_ms = profile_elapsed_ms(profile);
+    }
     int ef = std::max(cur_efSearch, k);
     if (bounded_queue) { // this is the most common branch, for now we only
                          // support Panorama search in this branch
@@ -2069,6 +2475,7 @@ HNSWStats search_impl(
                     index,
                     feature_trace,
                     onnx_query.get(),
+                    async_onnx_query.get(),
                     onnx_threshold,
                     raw_data_query.get(),
                     oracle_prefetch ? &oracle_final_set : nullptr,
@@ -2123,6 +2530,16 @@ HNSWStats search_impl(
             res.add_result(d, label);
             top_candidates.pop();
         }
+    }
+
+    if (profile) {
+        profile->graph_end_ms = profile_elapsed_ms(profile);
+    }
+    if (async_onnx_query) {
+        async_onnx_query->finish(*feature_trace);
+    }
+    if (profile) {
+        profile->inference_end_ms = profile_elapsed_ms(profile);
     }
 
     if (feature_trace) {

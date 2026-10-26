@@ -360,6 +360,8 @@ int main(int argc, char** argv) {
                    "[--avg-neighbor-distance SIDECAR] "
                    "[--onnx-model MODEL_ONNX] "
                    "[--onnx-provider cpu|cuda] [--onnx-device-id N] "
+                   "[--onnx-inference sync|async] "
+                   "[--onnx-gpu-inflight N] "
                    "[--threshold VALUE] "
                    "[--prefetch on|off --raw-data FILE "
                    "--payload-size BYTES --io-workers N "
@@ -386,7 +388,9 @@ int main(int argc, char** argv) {
                 static_cast<std::uint32_t>(batch_size_arg);
         std::string onnx_model_path;
         std::string onnx_provider = "cpu";
+        std::string onnx_inference = "sync";
         long onnx_device_id = 0;
+        long onnx_gpu_inflight = 0;
         bool onnx_provider_was_set = false;
         bool onnx_device_id_was_set = false;
         std::string avg_neighbor_distance_path;
@@ -437,6 +441,16 @@ int main(int argc, char** argv) {
                     throw std::runtime_error(
                             "--onnx-provider must be cpu, cuda, or gpu");
                 }
+            } else if (option == "--onnx-inference") {
+                onnx_inference = argv[argument++];
+                if (onnx_inference != "sync" &&
+                    onnx_inference != "async") {
+                    throw std::runtime_error(
+                            "--onnx-inference must be sync or async");
+                }
+            } else if (option == "--onnx-gpu-inflight") {
+                onnx_gpu_inflight = parse_positive(
+                        argv[argument++], "onnx-gpu-inflight");
             } else if (option == "--onnx-device-id") {
                 onnx_device_id = parse_nonnegative(
                         argv[argument++], "onnx-device-id");
@@ -466,6 +480,12 @@ int main(int argc, char** argv) {
             }
         }
         const bool onnx_enabled = !onnx_model_path.empty();
+        if (onnx_gpu_inflight && (!onnx_enabled || onnx_inference != "async" ||
+                                 (onnx_provider != "cuda" && onnx_provider != "gpu"))) {
+            throw std::runtime_error(
+                    "--onnx-gpu-inflight requires --onnx-model, "
+                    "--onnx-provider cuda and --onnx-inference async");
+        }
         if (threshold_was_set && !onnx_enabled) {
             throw std::runtime_error(
                     "--threshold requires --onnx-model");
@@ -475,6 +495,10 @@ int main(int argc, char** argv) {
             throw std::runtime_error(
                     "--onnx-provider and --onnx-device-id require "
                     "--onnx-model");
+        }
+        if (onnx_inference != "sync" && !onnx_enabled) {
+            throw std::runtime_error(
+                    "--onnx-inference async requires --onnx-model");
         }
         const bool raw_io_enabled = !raw_data_path.empty();
         if (raw_io_enabled != !prefetch_mode.empty()) {
@@ -588,9 +612,11 @@ int main(int argc, char** argv) {
             onnx_model = std::make_unique<faiss::HNSWOnnxModel>(
                     onnx_model_path,
                     onnx_provider,
-                    static_cast<int>(onnx_device_id));
+                    static_cast<int>(onnx_device_id),
+                    static_cast<size_t>(onnx_gpu_inflight));
             params.onnx_model = onnx_model.get();
             params.onnx_threshold = onnx_threshold;
+            params.onnx_async_inference = onnx_inference == "async";
         }
 
         std::vector<faiss::idx_t> oracle_final_ids;
@@ -645,6 +671,8 @@ int main(int argc, char** argv) {
         const auto search_started = std::chrono::steady_clock::now();
         std::uint64_t prediction_timesteps = 0;
         std::uint64_t prefetch_decisions = 0;
+        size_t gpu_pipeline_submitted = 0;
+        size_t gpu_pipeline_peak_inflight = 0;
         for (std::uint32_t first = 0; first < queries.count;
              first += batch_size) {
             const std::uint32_t count =
@@ -681,6 +709,9 @@ int main(int argc, char** argv) {
             for (std::uint32_t local = 0; local < count; ++local) {
                 const std::uint32_t query_id = first + local;
                 const faiss::HNSWQueryTrace& trace = collector.queries[local];
+                gpu_pipeline_submitted += trace.gpu_pipeline_submitted;
+                gpu_pipeline_peak_inflight = std::max(
+                        gpu_pipeline_peak_inflight, trace.gpu_pipeline_peak_inflight);
                 if (record_enabled) {
                     auto& destination =
                             recorded_replay.queries[query_id].timestep_node_ids;
@@ -793,6 +824,10 @@ int main(int argc, char** argv) {
                   << (onnx_model ? onnx_model->provider() : "none") << '\n'
                   << "onnx_device_id="
                   << (onnx_model ? onnx_model->device_id() : -1) << '\n'
+                  << "onnx_inference=" << onnx_inference << '\n'
+                  << "onnx_gpu_inflight=" << onnx_gpu_inflight << '\n'
+                  << "gpu_pipeline_submitted=" << gpu_pipeline_submitted << '\n'
+                  << "gpu_pipeline_peak_inflight=" << gpu_pipeline_peak_inflight << '\n'
                   << "onnx_threshold=" << onnx_threshold << '\n'
                   << "oracle_prefetch=" << oracle_prefetch << '\n'
                   << "warmup_search="

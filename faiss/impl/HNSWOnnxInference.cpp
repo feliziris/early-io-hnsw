@@ -6,11 +6,15 @@
  */
 
 #include <faiss/impl/HNSWOnnxInference.h>
+#include <faiss/impl/HNSWSearchProfile.h>
+#include <chrono>
 
 #include <algorithm>
 #include <array>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
+#include <mutex>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -21,12 +25,54 @@
 #ifdef FAISS_ENABLE_ONNX_RUNTIME
 #include <onnxruntime_cxx_api.h>
 #endif
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+#include <cuda_runtime_api.h>
+#endif
 
 namespace faiss {
 
 #ifdef FAISS_ENABLE_ONNX_RUNTIME
 
 namespace {
+
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+void check_cuda(cudaError_t status, const char* operation) {
+    FAISS_THROW_IF_NOT_FMT(
+            status == cudaSuccess, "%s: %s", operation,
+            cudaGetErrorString(status));
+}
+
+struct HNSWCudaStream {
+    cudaStream_t stream = nullptr;
+    explicit HNSWCudaStream(int device) {
+        check_cuda(cudaSetDevice(device), "cudaSetDevice");
+        check_cuda(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking),
+                   "cudaStreamCreateWithFlags");
+    }
+    ~HNSWCudaStream() {
+        cudaStreamSynchronize(stream);
+        cudaStreamDestroy(stream);
+    }
+};
+
+struct HNSWCudaHostBuffer {
+    float* data = nullptr;
+    explicit HNSWCudaHostBuffer(size_t elements) {
+        check_cuda(cudaMallocHost(reinterpret_cast<void**>(&data),
+                                  elements * sizeof(float)), "cudaMallocHost");
+    }
+    ~HNSWCudaHostBuffer() { cudaFreeHost(data); }
+};
+
+struct HNSWCudaEvent {
+    cudaEvent_t event = nullptr;
+    HNSWCudaEvent() {
+        check_cuda(cudaEventCreateWithFlags(&event, cudaEventDisableTiming),
+                   "cudaEventCreateWithFlags");
+    }
+    ~HNSWCudaEvent() { cudaEventDestroy(event); }
+};
+#endif
 
 Ort::Env& onnx_environment() {
     static Ort::Env environment(ORT_LOGGING_LEVEL_WARNING, "faiss-hnsw-lstm");
@@ -58,7 +104,8 @@ std::string normalize_provider(std::string provider) {
 
 Ort::SessionOptions make_session_options(
         const std::string& provider,
-        int device_id) {
+        int device_id,
+        void* compute_stream = nullptr) {
     FAISS_THROW_IF_NOT_FMT(
             device_id >= 0,
             "ONNX device ID must be non-negative, got %d",
@@ -77,6 +124,9 @@ Ort::SessionOptions make_session_options(
                 {"device_id", std::to_string(device_id)},
                 {"do_copy_in_default_stream", "1"},
         });
+        if (compute_stream) {
+            cuda_options.UpdateWithValue("user_compute_stream", compute_stream);
+        }
         options.AppendExecutionProvider_CUDA_V2(*cuda_options);
         // A requested GPU run must not silently move unsupported model nodes
         // to CPU. Host/device copy nodes inserted by ORT remain permitted.
@@ -115,6 +165,14 @@ struct HNSWOnnxModel::Impl {
     std::string path;
     std::string provider;
     int device_id = 0;
+    size_t pipeline_depth = 0;
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+    // Session is destroyed before its user stream. All query jobs must finish
+    // before the caller destroys the model.
+    std::unique_ptr<HNSWCudaStream> pipeline_stream;
+    mutable std::mutex pipeline_mutex;
+    std::unique_ptr<Ort::Allocator> pipeline_pinned_allocator;
+#endif
     // ONNX Runtime permits concurrent Run calls on one session, but its C++
     // wrapper exposes Run as non-const.
     mutable Ort::Session session;
@@ -130,23 +188,51 @@ struct HNSWOnnxModel::Impl {
     explicit Impl(
             const std::string& model_path,
             const std::string& provider_name,
-            int requested_device_id)
+            int requested_device_id,
+            size_t requested_depth)
             : path(model_path),
               provider(normalize_provider(provider_name)),
               device_id(requested_device_id),
+              pipeline_depth(requested_depth),
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+              pipeline_stream(requested_depth
+                      ? std::make_unique<HNSWCudaStream>(requested_device_id)
+                      : nullptr),
+#endif
               session(
                       onnx_environment(),
                       model_path.c_str(),
-                      make_session_options(provider, device_id)),
+                      make_session_options(provider, device_id
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+                              , pipeline_stream ? pipeline_stream->stream : nullptr
+#endif
+                              )),
               memory_info(Ort::MemoryInfo::CreateCpu(
                       OrtArenaAllocator,
                       OrtMemTypeDefault)) {
+        FAISS_THROW_IF_NOT_MSG(
+                !pipeline_depth || provider == "cuda",
+                "GPU pipeline requires the cuda provider");
+        FAISS_THROW_IF_NOT_MSG(pipeline_depth <= 1024,
+                              "GPU pipeline depth must not exceed 1024");
+#ifndef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+        FAISS_THROW_IF_NOT_MSG(!pipeline_depth,
+                              "Rebuild with FAISS_ENABLE_HNSW_CUDA_PIPELINE=ON");
+#endif
         if (provider == "cuda") {
             gpu_memory_info = std::make_unique<Ort::MemoryInfo>(
                     "Cuda",
                     OrtDeviceAllocator,
                     device_id,
                     OrtMemTypeDefault);
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+            if (pipeline_stream) {
+                Ort::MemoryInfo pinned_info("CudaPinned", OrtDeviceAllocator,
+                                            device_id, OrtMemTypeCPUOutput);
+                pipeline_pinned_allocator = std::make_unique<Ort::Allocator>(
+                        session, pinned_info);
+            }
+#endif
         }
         FAISS_THROW_IF_NOT_FMT(
                 session.GetInputCount() == 3,
@@ -180,6 +266,23 @@ struct HNSWOnnxModel::Impl {
                 feature_count == 6,
                 "HNSW ONNX model must accept exactly 6 features per rank");
     }
+
+    ~Impl() {
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+        if (pipeline_stream) {
+            // ORT can enqueue CPU-buffer-release callbacks during session
+            // teardown. Keep its pinned arena alive until those callbacks
+            // complete, then free pinned memory on this CPU thread rather
+            // than from a CUDA host callback (where cudaFreeHost is illegal).
+            cudaSetDevice(device_id);
+            cudaStreamSynchronize(pipeline_stream->stream);
+            auto pinned_guard = std::move(pipeline_pinned_allocator);
+            session = Ort::Session{nullptr};
+            cudaStreamSynchronize(pipeline_stream->stream);
+            pinned_guard.reset();
+        }
+#endif
+    }
 };
 
 struct HNSWOnnxQuery::Impl {
@@ -191,6 +294,28 @@ struct HNSWOnnxQuery::Impl {
     std::vector<Ort::Value> cell_gpu;
     size_t current_gpu_state = 0;
     bool has_gpu_state = false;
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+    struct PipelineSlot {
+        HNSWCudaHostBuffer host_features;
+        HNSWCudaHostBuffer host_probabilities;
+        Ort::Value device_features;
+        Ort::Value device_probabilities;
+        Ort::IoBinding binding;
+        HNSWCudaEvent done;
+
+        PipelineSlot(const HNSWOnnxModel::Impl& model, Ort::Allocator& allocator)
+                : host_features(model.topk * model.feature_count),
+                  host_probabilities(model.topk),
+                  device_features(Ort::Value::CreateTensor<float>(
+                          allocator, model.feature_shape.data(), 3)),
+                  device_probabilities(Ort::Value::CreateTensor<float>(
+                          allocator, model.feature_shape.data(), 2)),
+                  binding(model.session) {}
+    };
+    std::vector<std::unique_ptr<PipelineSlot>> pipeline_slots;
+    size_t pipeline_submitted = 0;
+    size_t pipeline_collected = 0;
+#endif
 
     explicit Impl(const HNSWOnnxModel::Impl& model_in)
             : model(model_in),
@@ -200,6 +325,9 @@ struct HNSWOnnxQuery::Impl {
                       0.0f),
               cell(hidden.size(), 0.0f) {
         if (model.provider == "cuda") {
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+            check_cuda(cudaSetDevice(model.device_id), "cudaSetDevice");
+#endif
             gpu_allocator = std::make_unique<Ort::Allocator>(
                     model.session, *model.gpu_memory_info);
             hidden_gpu.reserve(2);
@@ -214,15 +342,46 @@ struct HNSWOnnxQuery::Impl {
                         model.state_shape.data(),
                         model.state_shape.size()));
             }
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+            if (model.pipeline_depth) {
+                for (size_t slot = 0; slot < model.pipeline_depth; ++slot) {
+                    pipeline_slots.push_back(std::make_unique<PipelineSlot>(
+                            model, *gpu_allocator));
+                }
+                std::lock_guard<std::mutex> lock(model.pipeline_mutex);
+                check_cuda(cudaMemsetAsync(
+                        hidden_gpu[0].GetTensorMutableData<float>(), 0,
+                        hidden.size() * sizeof(float), model.pipeline_stream->stream),
+                        "initialize hidden state");
+                check_cuda(cudaMemsetAsync(
+                        cell_gpu[0].GetTensorMutableData<float>(), 0,
+                        cell.size() * sizeof(float), model.pipeline_stream->stream),
+                        "initialize cell state");
+                has_gpu_state = true;
+            }
+#endif
         }
     }
+
+    ~Impl() {
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+        // Also protects outstanding buffers on exceptions or early exit.
+        if (model.pipeline_stream) {
+            cudaSetDevice(model.device_id);
+            cudaStreamSynchronize(model.pipeline_stream->stream);
+        }
+#endif
+    }
+
 };
 
 HNSWOnnxModel::HNSWOnnxModel(
         const std::string& model_path,
         const std::string& provider,
-        int device_id)
-        : impl_(std::make_unique<Impl>(model_path, provider, device_id)) {}
+        int device_id,
+        size_t gpu_pipeline_depth)
+        : impl_(std::make_unique<Impl>(model_path, provider, device_id,
+                                      gpu_pipeline_depth)) {}
 
 HNSWOnnxModel::~HNSWOnnxModel() = default;
 HNSWOnnxModel::HNSWOnnxModel(HNSWOnnxModel&&) noexcept = default;
@@ -256,6 +415,10 @@ int HNSWOnnxModel::device_id() const {
     return impl_->device_id;
 }
 
+size_t HNSWOnnxModel::gpu_pipeline_depth() const {
+    return impl_->pipeline_depth;
+}
+
 std::unique_ptr<HNSWOnnxQuery> HNSWOnnxModel::create_query() const {
     return std::unique_ptr<HNSWOnnxQuery>(
             new HNSWOnnxQuery(std::make_unique<HNSWOnnxQuery::Impl>(*impl_)));
@@ -271,10 +434,129 @@ HNSWOnnxQuery::~HNSWOnnxQuery() = default;
 HNSWOnnxQuery::HNSWOnnxQuery(HNSWOnnxQuery&&) noexcept = default;
 HNSWOnnxQuery& HNSWOnnxQuery::operator=(HNSWOnnxQuery&&) noexcept = default;
 
+size_t HNSWOnnxQuery::gpu_pipeline_depth() const {
+    return impl_->model.pipeline_depth;
+}
+
+size_t HNSWOnnxQuery::gpu_pending() const {
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+    return impl_->pipeline_submitted - impl_->pipeline_collected;
+#else
+    return 0;
+#endif
+}
+
+void HNSWOnnxQuery::submit_gpu(const float* features, size_t feature_count,
+                             HNSWOnnxPredictProfile* profile) {
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+    using Clock = std::chrono::steady_clock;
+    const auto started = profile ? Clock::now() : Clock::time_point{};
+    const auto& model = impl_->model;
+    FAISS_THROW_IF_NOT_MSG(model.pipeline_depth, "CUDA pipeline is disabled");
+    FAISS_THROW_IF_NOT_MSG(gpu_pending() < model.pipeline_depth,
+                          "CUDA pipeline slots are full");
+    FAISS_THROW_IF_NOT_MSG(feature_count ==
+                          static_cast<size_t>(model.topk) * model.feature_count,
+                          "CUDA pipeline feature count mismatch");
+    check_cuda(cudaSetDevice(model.device_id), "cudaSetDevice");
+    auto& slot = *impl_->pipeline_slots[
+            impl_->pipeline_submitted % model.pipeline_depth];
+    std::memcpy(slot.host_features.data, features, feature_count * sizeof(float));
+    const size_t next = 1 - impl_->current_gpu_state;
+    auto& binding = slot.binding;
+    binding.BindInput("features", slot.device_features);
+    binding.BindInput("hidden_in", impl_->hidden_gpu[impl_->current_gpu_state]);
+    binding.BindInput("cell_in", impl_->cell_gpu[impl_->current_gpu_state]);
+    binding.BindOutput("probabilities", slot.device_probabilities);
+    binding.BindOutput("hidden_out", impl_->hidden_gpu[next]);
+    binding.BindOutput("cell_out", impl_->cell_gpu[next]);
+    Ort::RunOptions options;
+    options.AddConfigEntry("disable_synchronize_execution_providers", "1");
+    const auto prepared = profile ? Clock::now() : Clock::time_point{};
+    Clock::time_point run_started, run_ended, copies_ended;
+    {
+        // One ordered stream ensures h/c from t are ready before t+1 reads
+        // them. Serialize host submissions on a session shared by queries.
+        std::lock_guard<std::mutex> lock(model.pipeline_mutex);
+        const auto stream = model.pipeline_stream->stream;
+        check_cuda(cudaMemcpyAsync(
+                slot.device_features.GetTensorMutableData<float>(),
+                slot.host_features.data, feature_count * sizeof(float),
+                cudaMemcpyHostToDevice, stream), "copy features to GPU");
+        if (profile) run_started = Clock::now();
+        model.session.Run(options, binding);
+        if (profile) run_ended = Clock::now();
+        check_cuda(cudaMemcpyAsync(
+                slot.host_probabilities.data,
+                slot.device_probabilities.GetTensorData<float>(),
+                model.topk * sizeof(float), cudaMemcpyDeviceToHost, stream),
+                "copy probabilities to pinned CPU buffer");
+        check_cuda(cudaEventRecord(slot.done.event, stream), "record completion");
+        if (profile) copies_ended = Clock::now();
+    }
+    impl_->current_gpu_state = next;
+    ++impl_->pipeline_submitted;
+    if (profile) {
+        const auto ended = Clock::now();
+        const auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        profile->input_tensor_ms = ms(started, prepared);
+        profile->session_run_ms = ms(run_started, run_ended);
+        profile->transfer_enqueue_ms = ms(prepared, run_started) + ms(run_ended, copies_ended);
+        profile->state_update_ms = ms(copies_ended, ended);
+    }
+#else
+    FAISS_THROW_MSG("Rebuild with FAISS_ENABLE_HNSW_CUDA_PIPELINE=ON");
+#endif
+}
+
+bool HNSWOnnxQuery::collect_gpu(std::vector<float>& probabilities, bool wait,
+                              HNSWOnnxPredictProfile* profile) {
+#ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
+    using Clock = std::chrono::steady_clock;
+    const auto started = profile ? Clock::now() : Clock::time_point{};
+    if (!gpu_pending()) return false;
+    const auto& model = impl_->model;
+    check_cuda(cudaSetDevice(model.device_id), "cudaSetDevice");
+    auto& slot = *impl_->pipeline_slots[
+            impl_->pipeline_collected % model.pipeline_depth];
+    if (wait) {
+        check_cuda(cudaEventSynchronize(slot.done.event), "wait for GPU result");
+    } else {
+        const auto status = cudaEventQuery(slot.done.event);
+        if (status == cudaErrorNotReady) return false;
+        check_cuda(status, "query GPU result");
+    }
+    const auto ready = profile ? Clock::now() : Clock::time_point{};
+    probabilities.assign(slot.host_probabilities.data,
+                         slot.host_probabilities.data + model.topk);
+    ++impl_->pipeline_collected;
+    if (profile) {
+        const auto ended = Clock::now();
+        profile->collect_wait_ms =
+                std::chrono::duration<double, std::milli>(ready - started).count();
+        profile->probability_copy_ms =
+                std::chrono::duration<double, std::milli>(ended - ready).count();
+    }
+    return true;
+#else
+    FAISS_THROW_MSG("Rebuild with FAISS_ENABLE_HNSW_CUDA_PIPELINE=ON");
+#endif
+}
+
 std::vector<float> HNSWOnnxQuery::predict(
         const float* features,
-        size_t feature_count) {
+        size_t feature_count,
+        HNSWOnnxPredictProfile* profile) {
+    using Clock = std::chrono::steady_clock;
+    const auto input_started = profile ? Clock::now() : Clock::time_point{};
     const HNSWOnnxModel::Impl& model = impl_->model;
+    FAISS_THROW_IF_NOT_MSG(!model.pipeline_depth,
+                          "Use submit_gpu()/collect_gpu() for a pipeline model");
+    FAISS_THROW_IF_NOT_MSG(
+            !profile || model.provider == "cpu",
+            "Detailed predict() profiling currently supports the CPU provider");
     const size_t expected_features =
             static_cast<size_t>(model.topk) * model.feature_count;
     FAISS_THROW_IF_NOT_FMT(
@@ -357,6 +639,7 @@ std::vector<float> HNSWOnnxQuery::predict(
             "features", "hidden_in", "cell_in"};
     constexpr std::array<const char*, 3> output_names = {
             "probabilities", "hidden_out", "cell_out"};
+    const auto run_started = profile ? Clock::now() : Clock::time_point{};
     std::vector<Ort::Value> outputs = model.session.Run(
             Ort::RunOptions{nullptr},
             input_names.data(),
@@ -364,6 +647,7 @@ std::vector<float> HNSWOnnxQuery::predict(
             inputs.size(),
             output_names.data(),
             output_names.size());
+    const auto run_ended = profile ? Clock::now() : Clock::time_point{};
 
     const size_t probability_count = outputs[0]
                                              .GetTensorTypeAndShapeInfo()
@@ -384,10 +668,23 @@ std::vector<float> HNSWOnnxQuery::predict(
     const float* probability_data = outputs[0].GetTensorData<float>();
     const float* hidden_data = outputs[1].GetTensorData<float>();
     const float* cell_data = outputs[2].GetTensorData<float>();
+    const auto metadata_ended = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> probabilities(
             probability_data, probability_data + probability_count);
+    const auto copy_ended = profile ? Clock::now() : Clock::time_point{};
     std::copy(hidden_data, hidden_data + state_count, impl_->hidden.begin());
     std::copy(cell_data, cell_data + state_count, impl_->cell.begin());
+    if (profile) {
+        const auto state_ended = Clock::now();
+        const auto ms = [](auto begin, auto end) {
+            return std::chrono::duration<double, std::milli>(end - begin).count();
+        };
+        profile->input_tensor_ms = ms(input_started, run_started);
+        profile->session_run_ms = ms(run_started, run_ended);
+        profile->output_metadata_ms = ms(run_ended, metadata_ended);
+        profile->probability_copy_ms = ms(metadata_ended, copy_ended);
+        profile->state_update_ms = ms(copy_ended, state_ended);
+    }
     return probabilities;
 }
 
@@ -396,7 +693,8 @@ std::vector<float> HNSWOnnxQuery::predict(
 struct HNSWOnnxModel::Impl {};
 struct HNSWOnnxQuery::Impl {};
 
-HNSWOnnxModel::HNSWOnnxModel(const std::string&, const std::string&, int) {
+HNSWOnnxModel::HNSWOnnxModel(
+        const std::string&, const std::string&, int, size_t) {
     FAISS_THROW_MSG(
             "Faiss was built without ONNX Runtime; configure with "
             "FAISS_ENABLE_ONNX_RUNTIME=ON");
@@ -427,6 +725,7 @@ const std::string& HNSWOnnxModel::provider() const {
 int HNSWOnnxModel::device_id() const {
     return -1;
 }
+size_t HNSWOnnxModel::gpu_pipeline_depth() const { return 0; }
 std::unique_ptr<HNSWOnnxQuery> HNSWOnnxModel::create_query() const {
     FAISS_THROW_MSG("Faiss was built without ONNX Runtime");
 }
@@ -439,7 +738,16 @@ HNSWOnnxQuery::HNSWOnnxQuery(std::unique_ptr<Impl> impl)
 HNSWOnnxQuery::~HNSWOnnxQuery() = default;
 HNSWOnnxQuery::HNSWOnnxQuery(HNSWOnnxQuery&&) noexcept = default;
 HNSWOnnxQuery& HNSWOnnxQuery::operator=(HNSWOnnxQuery&&) noexcept = default;
-std::vector<float> HNSWOnnxQuery::predict(const float*, size_t) {
+size_t HNSWOnnxQuery::gpu_pipeline_depth() const { return 0; }
+size_t HNSWOnnxQuery::gpu_pending() const { return 0; }
+void HNSWOnnxQuery::submit_gpu(const float*, size_t, HNSWOnnxPredictProfile*) {
+    FAISS_THROW_MSG("Faiss was built without ONNX Runtime");
+}
+bool HNSWOnnxQuery::collect_gpu(std::vector<float>&, bool, HNSWOnnxPredictProfile*) {
+    FAISS_THROW_MSG("Faiss was built without ONNX Runtime");
+}
+std::vector<float> HNSWOnnxQuery::predict(
+        const float*, size_t, HNSWOnnxPredictProfile*) {
     FAISS_THROW_MSG("Faiss was built without ONNX Runtime");
 }
 

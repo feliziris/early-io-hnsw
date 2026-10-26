@@ -20,6 +20,7 @@
 #include <faiss/Index.h>
 #include <faiss/impl/DistanceComputer.h>
 #include <faiss/impl/FaissAssert.h>
+#include <faiss/impl/HNSWSearchProfile.h>
 #include <faiss/impl/maybe_owned_vector.h>
 #include <faiss/utils/Heap.h>
 #include <faiss/utils/random.h>
@@ -92,6 +93,8 @@ struct HNSWQueryTrace {
     std::vector<HNSWFeatureTimestep> timesteps;
     std::vector<int32_t> final_top_k_ids;
     std::vector<float> final_top_k_distances;
+    size_t gpu_pipeline_submitted = 0;
+    size_t gpu_pipeline_peak_inflight = 0;
 };
 
 /** Output container for optional HNSW runtime feature collection.
@@ -122,6 +125,14 @@ struct SearchParametersHNSW : SearchParameters {
     /// The caller owns this model and must keep it alive through search().
     HNSWOnnxModel* onnx_model = nullptr;
     float onnx_threshold = 0.5f;
+    /** Run the streaming ONNX model on a reusable worker per search thread.
+     * The worker is created on first use and lives until that search thread
+     * exits. Worker startup completes before raw-payload query latency
+     * accounting begins. Each query has fresh recurrent state and a snapshot
+     * FIFO; its job is drained before final raw-data readiness is evaluated. */
+    bool onnx_async_inference = false;
+    /// Optional single-query diagnostics. Caller owns the profile; n must be 1.
+    HNSWSearchProfile* search_profile = nullptr;
     /// Optional raw-payload reader. A query waits until its final top-k
     /// payloads are resident/read before search() returns.
     /// The caller owns this object and must keep it alive through search().

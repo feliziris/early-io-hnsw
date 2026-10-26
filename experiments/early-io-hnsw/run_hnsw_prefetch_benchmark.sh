@@ -12,6 +12,10 @@ batch_size="${3:-1}"
 threshold="${4:-0.5}"
 onnx_provider="${ONNX_PROVIDER:-cpu}"
 onnx_device_id="${ONNX_DEVICE_ID:-0}"
+onnx_inference="${ONNX_INFERENCE:-sync}"
+onnx_gpu_inflight="${ONNX_GPU_INFLIGHT:-0}"
+run_modes="${RUN_MODES:-off on}"
+warmup_search="${WARMUP_SEARCH:-false}"
 
 ef_search="${EF_SEARCH:-200}"
 io_workers="${IO_WORKERS:-4}"
@@ -94,8 +98,12 @@ run_one() {
             --onnx-model "${onnx_model}"
             --onnx-provider "${onnx_provider}"
             --onnx-device-id "${onnx_device_id}"
+            --onnx-inference "${onnx_inference}"
             --threshold "${threshold}"
         )
+        if [[ "${onnx_gpu_inflight}" != "0" ]]; then
+            command+=(--onnx-gpu-inflight "${onnx_gpu_inflight}")
+        fi
     fi
     command+=(
         --prefetch "${mode}"
@@ -105,6 +113,9 @@ run_one() {
         --io-queue-size "${io_queue_size}"
         --evict-file-cache
     )
+    if [[ "${warmup_search}" == "true" ]]; then
+        command+=(--warmup-search)
+    fi
 
     echo "start round=${round} prefetch=${mode}"
     OMP_NUM_THREADS=1 "${command[@]}" 2>&1 | tee "${log}"
@@ -140,14 +151,23 @@ raw_data=${raw_data}
 onnx_model=${onnx_model}
 onnx_provider=${onnx_provider}
 onnx_device_id=${onnx_device_id}
+onnx_inference=${onnx_inference}
+onnx_gpu_inflight=${onnx_gpu_inflight}
+run_modes=${run_modes}
+warmup_search=${warmup_search}
 avg_neighbor_distance=${avg_neighbor_distance:-computed_at_startup}
 omp_num_threads=1
 evict_file_cache=true
 EOF
 
 for ((round = 1; round <= repetitions; ++round)); do
-    run_one "${round}" off
-    run_one "${round}" on
+    for mode in ${run_modes}; do
+        if [[ "${mode}" != "off" && "${mode}" != "on" ]]; then
+            echo "RUN_MODES entries must be off or on: ${mode}" >&2
+            exit 2
+        fi
+        run_one "${round}" "${mode}"
+    done
 done
 
 echo "benchmark complete"

@@ -47,6 +47,7 @@ struct HNSWRawDataSummary {
 };
 
 class HNSWRawDataQuery;
+struct HNSWSearchProfile;
 
 /** Shared mmap and bounded worker queue for HNSW payload reads. */
 class HNSWRawDataPrefetcher {
@@ -62,7 +63,8 @@ class HNSWRawDataPrefetcher {
     HNSWRawDataPrefetcher(const HNSWRawDataPrefetcher&) = delete;
     HNSWRawDataPrefetcher& operator=(const HNSWRawDataPrefetcher&) = delete;
 
-    std::unique_ptr<HNSWRawDataQuery> create_query(bool prefetch_enabled);
+    std::unique_ptr<HNSWRawDataQuery> create_query(
+            bool prefetch_enabled, HNSWSearchProfile* profile = nullptr);
     void drain();
     HNSWRawDataSummary summary() const;
 

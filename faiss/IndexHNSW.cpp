@@ -603,6 +603,9 @@ void hnsw_search(
         }
     }
 
+    FAISS_THROW_IF_NOT_MSG(
+            !hnsw_params || !hnsw_params->search_profile || n == 1,
+            "HNSW search profiling requires exactly one query");
     if (hnsw_params && hnsw_params->oracle_prefetch) {
         FAISS_THROW_IF_NOT_MSG(
                 hnsw_params->oracle_final_ids,

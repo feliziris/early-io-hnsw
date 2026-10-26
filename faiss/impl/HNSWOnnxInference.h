@@ -14,6 +14,8 @@
 
 namespace faiss {
 
+struct HNSWOnnxPredictProfile;
+
 /** One-query recurrent state for a streaming HNSW LSTM model. */
 class HNSWOnnxQuery {
    public:
@@ -25,7 +27,22 @@ class HNSWOnnxQuery {
     HNSWOnnxQuery& operator=(const HNSWOnnxQuery&) = delete;
 
     /** Run one timestep. Features are rank-major [k, 6]. */
-    std::vector<float> predict(const float* features, size_t feature_count);
+    std::vector<float> predict(
+            const float* features,
+            size_t feature_count,
+            HNSWOnnxPredictProfile* profile = nullptr);
+
+    /** CUDA pipeline only. Enqueue one ordered timestep without waiting for
+     * its result. Throws if all slots are occupied. Input is copied into
+     * owned pinned memory before returning. Do not mix with predict(). */
+    void submit_gpu(const float* features, size_t feature_count,
+                    HNSWOnnxPredictProfile* profile = nullptr);
+    /** Collect the oldest prediction. Returns false if none is pending or,
+     * when wait=false, if it has not completed yet. */
+    bool collect_gpu(std::vector<float>& probabilities, bool wait,
+                     HNSWOnnxPredictProfile* profile = nullptr);
+    size_t gpu_pending() const;
+    size_t gpu_pipeline_depth() const;
 
    private:
     struct Impl;
@@ -44,7 +61,8 @@ class HNSWOnnxModel {
     explicit HNSWOnnxModel(
             const std::string& model_path,
             const std::string& provider = "cpu",
-            int device_id = 0);
+            int device_id = 0,
+            size_t gpu_pipeline_depth = 0);
     ~HNSWOnnxModel();
 
     HNSWOnnxModel(HNSWOnnxModel&&) noexcept;
@@ -60,6 +78,7 @@ class HNSWOnnxModel {
     const std::string& model_path() const;
     const std::string& provider() const;
     int device_id() const;
+    size_t gpu_pipeline_depth() const;
 
     std::unique_ptr<HNSWOnnxQuery> create_query() const;
 

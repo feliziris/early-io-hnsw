@@ -82,6 +82,62 @@ and validation reports are written beside each checkpoint as `model.onnx` and
 one-timestep PyTorch, and one-timestep ONNX Runtime outputs on a real test
 trace.
 
+### CPU/GPU streaming pipeline in Faiss
+
+Build with `FAISS_ENABLE_ONNX_RUNTIME=ON` and
+`FAISS_ENABLE_HNSW_CUDA_PIPELINE=ON` (requires CUDA Toolkit). Add these options
+to `generate_sift_query_labels` along with the model and usual search/I/O options:
+
+```bash
+--onnx-model /path/to/model.onnx \
+--onnx-provider cuda --onnx-inference async --onnx-gpu-inflight 8
+```
+
+The HNSW search thread copies feature snapshots into a per-query FIFO and
+continues searching. The reusable CPU inference worker copies each snapshot
+into an owned pinned-memory slot, enqueues host-to-device transfer and ONNX
+execution, and collects completed predictions in timestep order. It checks the
+threshold and submits deduplicated raw-data reads on the CPU. A single persistent
+CUDA stream preserves hidden/cell dependencies between successive timesteps;
+timesteps are not independent batches. The model/session/stream stay alive when
+the GPU has no work. Recurrent state is initialized separately for each query.
+
+`--onnx-gpu-inflight` bounds slots holding submitted predictions, not I/O queue
+depth. A slot is reused only after its completion event and CPU result copy.
+When the GPU lags, snapshots accumulate in the CPU FIFO; when it is fast, the
+queues may stay empty. The worker waits for a GPU result only when slots are full
+or search has ended; otherwise it polls completion while accepting new snapshots.
+ORT asynchronous execution is requested, but host-side Run/launch overhead can
+still limit overlap. No CUDA Graph optimization is enabled. Query completion
+drains all predictions before final raw-data completion; this drain remains part
+of the measured search time. Existing CPU/synchronous CUDA behavior is unchanged
+when the new option is omitted. The benchmark wrapper forwards
+`ONNX_GPU_INFLIGHT=8` with `ONNX_PROVIDER=cuda` and `ONNX_INFERENCE=async`.
+
+`validate_hnsw_cuda_pipeline MODEL.onnx 200` checks CPU/synchronous CUDA versus
+pipeline output, recurrent-state reset across queries, and bounded-slot reuse
+at depths 1, 2, and 8. Optional arguments `INDEX QUERY.fvecs SIDECAR RAW`
+also validate one real HNSW query and 4-KiB prefetch decisions. A peak pending
+count alone does not establish concurrent GPU/CPU execution.
+
+For a diagnostic GPU-pipeline profile of one query:
+
+```bash
+OMP_NUM_THREADS=1 OPENBLAS_NUM_THREADS=1 build-onnx/demos/profile_hnsw_single_query \
+  INDEX QUERY.fvecs SIDECAR MODEL.onnx RAW OUTPUT.json 0 cuda 8
+python3 experiments/early-io-hnsw/python/plot_single_query_profile.py \
+  OUTPUT.json --output workspace/results/figure/single_query_gpu.png
+```
+
+The executable uses k from the model, efSearch=200, threshold=0.5, four I/O
+workers, and 4-KiB payloads. CPU-reference and actual-provider warmups run
+outside the measured query. The JSON separates critical-path search phases,
+snapshot FIFO delays, and inference-thread input/binding, Run call, transfer
+enqueue, completion collection, and threshold/I/O work. These are CPU-side
+wall-clock measurements: Run call duration is not a pure GPU-kernel timer.
+Inference and search lanes overlap and must not be summed. Instrumentation
+adds overhead; this single-query diagnostic is not a throughput benchmark.
+
 ## Offline inference
 
 Use the same `inference.py` for every trained top-k model. `--topk` selects
