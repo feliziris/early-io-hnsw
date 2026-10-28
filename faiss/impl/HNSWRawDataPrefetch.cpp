@@ -303,6 +303,7 @@ struct HNSWRawDataQuery::Impl {
     Clock::time_point search_started = Clock::now();
     std::unordered_map<int32_t, std::shared_ptr<ReadRequest>> requests;
     bool finished = false;
+    std::mutex requests_mutex;
     HNSWSearchProfile* profile = nullptr;
 
     Impl(HNSWRawDataPrefetcher::Impl& input_owner, bool enabled)
@@ -384,6 +385,7 @@ HNSWRawDataQuery& HNSWRawDataQuery::operator=(
         HNSWRawDataQuery&&) noexcept = default;
 
 void HNSWRawDataQuery::submit(int32_t node_id) {
+    std::lock_guard<std::mutex> lock(impl_->requests_mutex);
     if (!impl_->prefetch_enabled || impl_->finished) {
         return;
     }
@@ -394,10 +396,14 @@ void HNSWRawDataQuery::submit(int32_t node_id) {
 }
 
 void HNSWRawDataQuery::finish(const std::vector<int32_t>& final_ids) {
+    std::unique_lock<std::mutex> lock(impl_->requests_mutex);
     if (impl_->finished) {
         throw std::runtime_error("raw data query was already finished");
     }
     impl_->finished = true;
+    // No further speculative submissions can mutate requests after this point.
+    // Release before queue submissions/waits so the inference worker can exit.
+    lock.unlock();
     const Clock::time_point search_ended = Clock::now();
     if (impl_->profile) {
         impl_->profile->search_end_ms =

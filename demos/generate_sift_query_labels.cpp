@@ -717,6 +717,11 @@ int main(int argc, char** argv) {
                             recorded_replay.queries[query_id].timestep_node_ids;
                     destination.reserve(trace.timesteps.size());
                     for (const auto& timestep : trace.timesteps) {
+                        if (timestep.prefetch_decisions.empty() &&
+                            params.onnx_async_inference && raw_io_enabled) {
+                            destination.emplace_back();
+                            continue;
+                        }
                         if (timestep.prefetch_decisions.size() != k) {
                             throw std::runtime_error(
                                     "cannot record incomplete model decision "
@@ -735,6 +740,12 @@ int main(int argc, char** argv) {
                 }
                 if (onnx_enabled) {
                     for (const auto& timestep : trace.timesteps) {
+                        // Traversal completion cancels snapshots not yet predicted.
+                        if (timestep.prediction_probabilities.empty() &&
+                            timestep.prefetch_decisions.empty() &&
+                            params.onnx_async_inference && raw_io_enabled) {
+                            continue;
+                        }
                         if (timestep.prediction_probabilities.size() != k ||
                             timestep.prefetch_decisions.size() != k) {
                             throw std::runtime_error(

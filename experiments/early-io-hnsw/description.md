@@ -363,3 +363,15 @@ SIFT 원본 데이터, CMake 빌드 디렉터리, 생성된 HNSW 인덱스는 Gi
 `std::shuffle`의 정확한 순열은 C++ 표준 라이브러리 구현에 영향을 받을 수
 있다. 다른 툴체인에서도 완전히 같은 표본이 필요하면 최초 실행에서 생성한
 TSV 매핑을 원본 ID 목록으로 보존해야 한다.
+
+## 탐색 종료 시 비동기 예측 중단
+
+현재 live 비동기 검색은 그래프 탐색이 끝나면 아직 시작하지 않은 snapshot을
+버리고, 최종 top-k 중 이미 제출한 요청을 재사용하며 나머지를 즉시 같은 I/O
+worker queue에 제출한다. 최종 I/O 요청을 제출하기 전에 예측 backlog를
+기다리지 않는다. 이미 실행 중인 CPU ONNX 호출이나 CUDA 작업은 강제 취소하지
+않으며, payload I/O와 겹쳐 마무리한 뒤 반환 전에 자원을 정리한다. 따라서
+payload 준비 완료 시각과 실제 search() 반환 시각은 다를 수 있다.
+
+취소된 timestep의 prediction/decision 배열은 비어 있다. raw payload reader가
+없는 trace 수집·검증 검색은 기존처럼 모든 timestep의 예측을 완료한다.

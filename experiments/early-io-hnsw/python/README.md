@@ -108,9 +108,11 @@ When the GPU lags, snapshots accumulate in the CPU FIFO; when it is fast, the
 queues may stay empty. The worker waits for a GPU result only when slots are full
 or search has ended; otherwise it polls completion while accepting new snapshots.
 ORT asynchronous execution is requested, but host-side Run/launch overhead can
-still limit overlap. No CUDA Graph optimization is enabled. Query completion
-drains all predictions before final raw-data completion; this drain remains part
-of the measured search time. Existing CPU/synchronous CUDA behavior is unchanged
+still limit overlap. No CUDA Graph optimization is enabled. When live payload I/O is enabled, traversal completion cancels queued snapshots
+and immediately submits missing final-top-k reads. Already-running CPU inference
+or submitted CUDA work is finalized concurrently with payload I/O; it is joined
+before search returns to preserve object lifetimes. Trace-only runs without a
+payload reader still drain all predictions for validation. Existing CPU/synchronous CUDA behavior is unchanged
 when the new option is omitted. The benchmark wrapper forwards
 `ONNX_GPU_INFLIGHT=8` with `ONNX_PROVIDER=cuda` and `ONNX_INFERENCE=async`.
 
@@ -209,3 +211,27 @@ time its score reaches `--prefetch-threshold` (default 0.5); later appearances
 are ignored. `wasted_io_ratio` is `prefetch_fp / (prefetch_tp + prefetch_fn)`.
 `decision_delay_mean` is the mean difference between a node's first result-queue
 appearance timestep and its first prefetch-decision timestep.
+
+### Stop prediction at traversal completion
+
+Live asynchronous search no longer drains its snapshot backlog before issuing
+final-result reads. It discards unstarted snapshots, closes speculative I/O at
+final-result accounting, reuses previously submitted final-node requests, and
+submits demand reads for the remaining nodes on the same worker queue. Reads
+already submitted for false positives are not cancelled.
+
+Unprocessed timesteps retain empty prediction/decision arrays in the trace.
+The generator counts only completed predictions; replay recording emits empty
+entries for cancelled timesteps. Traces without a payload reader remain complete.
+The diagnostic profile reports `prediction_policy=stop_at_graph_end`,
+`search_call_ms`, and `prediction_cleanup_after_data_ready_ms`. Payload-ready
+end-to-end timing excludes subsequent inference/trace cleanup; the search call
+includes it. `inference_end` can therefore follow `data_ready`. The legacy
+`inference_drain_and_writeback` critical-path phase is zero for this policy.
+
+Run the synthetic cancellation/concurrent-I/O regression validator with:
+
+```bash
+cmake --build build-onnx-cpu --target validate_hnsw_async_stop
+build-onnx-cpu/demos/validate_hnsw_async_stop MODEL.onnx
+```

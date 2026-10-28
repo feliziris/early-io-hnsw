@@ -84,6 +84,7 @@ class HNSWRawDataQuery {
     HNSWRawDataQuery(const HNSWRawDataQuery&) = delete;
     HNSWRawDataQuery& operator=(const HNSWRawDataQuery&) = delete;
 
+    /// Safe concurrently with finish(); submissions after finalization are ignored.
     void submit(int32_t node_id);
     void finish(const std::vector<int32_t>& final_ids);
 

@@ -81,6 +81,7 @@ struct HNSWFeatureTimestep {
     std::vector<int32_t> node_ids;
     std::vector<float> query_distances;
     std::vector<float> features;
+    /// Empty when live async inference cancelled this snapshot at traversal end.
     std::vector<float> prediction_probabilities;
     std::vector<uint8_t> prefetch_decisions;
 };
@@ -129,7 +130,9 @@ struct SearchParametersHNSW : SearchParameters {
      * The worker is created on first use and lives until that search thread
      * exits. Worker startup completes before raw-payload query latency
      * accounting begins. Each query has fresh recurrent state and a snapshot
-     * FIFO; its job is drained before final raw-data readiness is evaluated. */
+     * FIFO. With payload I/O, traversal completion cancels queued snapshots
+     * and immediately issues final-result reads. Active inference is joined
+     * after payload readiness to preserve caller-owned object lifetimes. */
     bool onnx_async_inference = false;
     /// Optional single-query diagnostics. Caller owns the profile; n must be 1.
     HNSWSearchProfile* search_profile = nullptr;

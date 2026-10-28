@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cinttypes>
 #include <cstddef>
 #include <chrono>
@@ -1327,9 +1328,9 @@ HNSWAsyncOnnxWorker& async_onnx_worker() {
  * The HNSW thread deep-copies each observable result-queue snapshot into a
  * FIFO. A reusable worker processes the recurrent HNSWOnnxQuery, preserving
  * LSTM state order, and submits predicted raw-data reads as soon as each
- * prediction completes. finish() waits for this query's job before
- * HNSWRawDataQuery::finish(), so its non-thread-safe per-query request map is
- * never accessed concurrently with final-result accounting.
+ * prediction completes. At traversal completion, cancel_pending() discards
+ * queued snapshots. Final payload I/O starts before the active prediction is
+ * joined; the raw-data query synchronizes request-map access.
  */
 class HNSWAsyncOnnxQuery {
    public:
@@ -1368,13 +1369,24 @@ class HNSWAsyncOnnxQuery {
         ready_.notify_one();
     }
 
+    void cancel_pending() {
+        {
+            std::lock_guard<std::mutex> lock(mutex_);
+            cancelled_.store(true, std::memory_order_relaxed);
+            closed_ = true;
+            tasks_.clear();
+        }
+        ready_.notify_one();
+    }
+
     void finish(HNSWQueryTrace& trace) {
         close_and_wait();
         if (error_) {
             std::rethrow_exception(error_);
         }
         FAISS_THROW_IF_NOT_FMT(
-                completed_.size() == trace.timesteps.size(),
+                cancelled_.load(std::memory_order_relaxed) ||
+                        completed_.size() == trace.timesteps.size(),
                 "async ONNX completed %zu of %zu timesteps",
                 completed_.size(),
                 trace.timesteps.size());
@@ -1458,7 +1470,8 @@ class HNSWAsyncOnnxQuery {
                      ++rank) {
                     result.decisions[rank] = static_cast<uint8_t>(
                             result.probabilities[rank] >= threshold_);
-                    if (raw_data_query_ && result.decisions[rank] &&
+                    if (!cancelled_.load(std::memory_order_relaxed) &&
+                        raw_data_query_ && result.decisions[rank] &&
                         task.node_ids[rank] >= 0) {
                         raw_data_query_->submit(task.node_ids[rank]);
                     }
@@ -1493,7 +1506,8 @@ class HNSWAsyncOnnxQuery {
             for (size_t rank = 0; rank < result.probabilities.size(); ++rank) {
                 result.decisions[rank] = static_cast<uint8_t>(
                         result.probabilities[rank] >= threshold_);
-                if (raw_data_query_ && result.decisions[rank] &&
+                if (!cancelled_.load(std::memory_order_relaxed) &&
+                    raw_data_query_ && result.decisions[rank] &&
                     snapshot.node_ids[rank] >= 0) {
                     raw_data_query_->submit(snapshot.node_ids[rank]);
                 }
@@ -1585,6 +1599,7 @@ class HNSWAsyncOnnxQuery {
     std::condition_variable ready_;
     std::deque<Task> tasks_;
     bool closed_ = false;
+    std::atomic<bool> cancelled_{false};
     std::vector<Result> completed_;
     std::exception_ptr error_;
     std::future<void> completion_;
@@ -2535,10 +2550,16 @@ HNSWStats search_impl(
     if (profile) {
         profile->graph_end_ms = profile_elapsed_ms(profile);
     }
-    if (async_onnx_query) {
+    // With payload I/O, stop speculative work as soon as traversal is done.
+    // Do not delay demand reads behind the snapshot backlog. Without payload
+    // I/O, retain complete predictions for offline validation/trace generation.
+    const bool stop_predictions = async_onnx_query && raw_data_query;
+    if (stop_predictions) {
+        async_onnx_query->cancel_pending();
+    } else if (async_onnx_query) {
         async_onnx_query->finish(*feature_trace);
     }
-    if (profile) {
+    if (profile && !stop_predictions) {
         profile->inference_end_ms = profile_elapsed_ms(profile);
     }
 
@@ -2554,6 +2575,16 @@ HNSWStats search_impl(
             final_result.k = k;
             collect_final_top_k<C>(res, final_result);
             raw_data_query->finish(final_result.final_top_k_ids);
+        }
+    }
+
+    if (stop_predictions) {
+        // Only an already-running CPU prediction / submitted CUDA slots remain.
+        // Their cleanup overlaps final I/O; joining preserves caller-owned
+        // model, trace, profile and raw-query lifetimes before search returns.
+        async_onnx_query->finish(*feature_trace);
+        if (profile) {
+            profile->inference_end_ms = profile_elapsed_ms(profile);
         }
     }
 

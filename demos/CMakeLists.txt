@@ -43,3 +43,7 @@ add_executable(demo_residual_quantizer EXCLUDE_FROM_ALL demo_residual_quantizer.
 target_link_libraries(demo_residual_quantizer PRIVATE faiss)
 
 add_subdirectory(diversity_filter)
+
+find_package(OpenMP REQUIRED)
+add_executable(validate_hnsw_async_stop EXCLUDE_FROM_ALL validate_hnsw_async_stop.cpp)
+target_link_libraries(validate_hnsw_async_stop PRIVATE faiss OpenMP::OpenMP_CXX)

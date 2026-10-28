@@ -163,15 +163,20 @@ int main(int argc, char** argv) {
             }
             float error = 0;
             for (size_t t = 0; t < actual.timesteps.size(); ++t) {
-                if (actual.timesteps[t].node_ids != reference.timesteps[t].node_ids ||
-                    actual.timesteps[t].prefetch_decisions != reference.timesteps[t].prefetch_decisions) {
+                if (actual.timesteps[t].node_ids != reference.timesteps[t].node_ids) {
+                    throw std::runtime_error("HNSW snapshots changed");
+                }
+                if (actual.timesteps[t].prediction_probabilities.empty()) {
+                    continue; // Cancelled at traversal completion.
+                }
+                if (actual.timesteps[t].prefetch_decisions != reference.timesteps[t].prefetch_decisions) {
                     throw std::runtime_error("HNSW snapshot/prefetch decisions changed");
                 }
                 error = std::max(error, max_error(
                         actual.timesteps[t].prediction_probabilities,
                         reference.timesteps[t].prediction_probabilities));
             }
-            if (error > 1e-4f || actual.gpu_pipeline_submitted != actual.timesteps.size()) {
+            if (error > 1e-4f || actual.gpu_pipeline_submitted > actual.timesteps.size()) {
                 throw std::runtime_error("HNSW pipeline inference validation failed");
             }
             const auto stats = raw.summary();

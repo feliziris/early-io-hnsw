@@ -68,7 +68,10 @@ int main(int argc, char** argv) {
         params.prefetch_enabled = true;
         params.onnx_async_inference = true;
         params.search_profile = &profile;
+        const auto measured_started = std::chrono::steady_clock::now();
         index->search(1, query.data(), k, distances.data(), labels.data(), &params);
+        const double search_call_ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - measured_started).count();
         const auto drain_started = std::chrono::steady_clock::now();
         raw.drain(); // FP requests can outlive final top-k readiness.
         const double drain_ms = std::chrono::duration<double, std::milli>(
@@ -79,7 +82,12 @@ int main(int argc, char** argv) {
             throw std::runtime_error("profile changed search results");
         }
         float max_error = 0;
+        size_t predicted_timesteps = 0;
         for (size_t t = 0; t < trace.timesteps.size(); ++t) {
+            if (trace.timesteps[t].prediction_probabilities.empty()) {
+                continue;
+            }
+            ++predicted_timesteps;
             if (trace.timesteps[t].prefetch_decisions != reference.timesteps[t].prefetch_decisions) {
                 throw std::runtime_error("profile changed prefetch decisions");
             }
@@ -89,7 +97,7 @@ int main(int argc, char** argv) {
                         reference.timesteps[t].prediction_probabilities[r]));
             }
         }
-        if (profile.inference_events.size() != trace.timesteps.size() || max_error > 1e-4f) {
+        if (profile.inference_events.size() != predicted_timesteps || max_error > 1e-4f) {
             throw std::runtime_error("profile inference validation failed");
         }
         if (std::abs(profile.data_ready_ms - summary.end_to_end_latency.mean_us / 1000) > 1e-6) {
@@ -111,20 +119,25 @@ int main(int argc, char** argv) {
             << "  \"payload_bytes\": 4096,\n  \"evict_file_cache_advised\": true,\n"
             << "  \"worker_startup_excluded\": true,\n  \"untimed_provider_warmup\": true,\n"
             << "  \"profiling_enabled\": true,\n  \"timesteps\": " << trace.timesteps.size()
+            << ",\n  \"prediction_policy\": \"stop_at_graph_end\""
+            << ",\n  \"search_call_ms\": " << search_call_ms
+            << ",\n  \"prediction_timesteps\": " << predicted_timesteps
+            << ",\n  \"prediction_cleanup_after_data_ready_ms\": "
+            << std::max(0.0, profile.inference_end_ms - profile.data_ready_ms)
             << ",\n  \"end_to_end_ms\": " << profile.data_ready_ms
             << ",\n  \"phases_ms\": {\n"
             << "    \"upper_levels\": " << profile.upper_end_ms
             << ",\n    \"query_setup\": " << profile.setup_end_ms - profile.upper_end_ms
             << ",\n    \"level0\": " << profile.graph_end_ms - profile.setup_end_ms
-            << ",\n    \"inference_drain_and_writeback\": " << profile.inference_end_ms - profile.graph_end_ms
-            << ",\n    \"final_result_extraction\": " << profile.search_end_ms - profile.inference_end_ms
+            << ",\n    \"inference_drain_and_writeback\": " << 0.0
+            << ",\n    \"final_result_extraction\": " << profile.search_end_ms - profile.graph_end_ms
             << ",\n    \"final_request_lookup_and_submit\": " << profile.requests_submitted_ms - profile.search_end_ms
             << ",\n    \"final_payload_wait\": " << profile.data_ready_ms - profile.requests_submitted_ms
             << "\n  },\n  \"nested_work_ms\": {\n"
             << "    \"feature\": " << profile.feature_ms
             << ",\n    \"snapshot_enqueue\": " << profile.enqueue_ms
             << ",\n    \"predict_total\": " << profile.predict_ms
-            << ",\n    \"predict_mean\": " << profile.predict_ms / trace.timesteps.size()
+            << ",\n    \"predict_mean\": " << (predicted_timesteps ? profile.predict_ms / predicted_timesteps : 0.0)
             << ",\n    \"threshold_and_io_submit\": " << profile.io_submit_ms
             << "\n  },\n  \"boundaries_ms\": {\n"
             << "    \"upper_end\": " << profile.upper_end_ms

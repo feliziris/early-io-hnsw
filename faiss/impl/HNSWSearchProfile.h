@@ -37,6 +37,7 @@ struct HNSWSearchProfile {
     double upper_end_ms = 0;
     double setup_end_ms = 0;
     double graph_end_ms = 0;
+    // May follow data_ready_ms when cancelled inference needs final cleanup.
     double inference_end_ms = 0;
     double search_end_ms = 0;
     double requests_submitted_ms = 0;
