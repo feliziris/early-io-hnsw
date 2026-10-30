@@ -184,6 +184,7 @@ struct HNSWOnnxModel::Impl {
     int feature_count = 0;
     int num_layers = 0;
     int hidden_size = 0;
+    bool has_cell = true;
 
     explicit Impl(
             const std::string& model_path,
@@ -234,24 +235,38 @@ struct HNSWOnnxModel::Impl {
             }
 #endif
         }
-        FAISS_THROW_IF_NOT_FMT(
-                session.GetInputCount() == 3,
-                "HNSW ONNX model must have 3 inputs, got %zu",
-                session.GetInputCount());
-        FAISS_THROW_IF_NOT_FMT(
-                session.GetOutputCount() == 3,
-                "HNSW ONNX model must have 3 outputs, got %zu",
-                session.GetOutputCount());
+        const size_t input_count = session.GetInputCount();
+        FAISS_THROW_IF_NOT_MSG(
+                input_count == 2 || input_count == 3,
+                "HNSW ONNX model must have 2 (GRU) or 3 (LSTM) inputs");
+        has_cell = input_count == 3;
+        FAISS_THROW_IF_NOT_MSG(
+                session.GetOutputCount() == input_count,
+                "HNSW ONNX model must have matching input/output counts");
+        // The streaming exporter defines this order for both recurrent models.
+        Ort::AllocatorWithDefaultOptions name_allocator;
+        const char* input_names[] = {"features", "hidden_in", "cell_in"};
+        const char* output_names[] = {"probabilities", "hidden_out", "cell_out"};
+        for (size_t i = 0; i < input_count; ++i) {
+            auto input_name = session.GetInputNameAllocated(i, name_allocator);
+            auto output_name = session.GetOutputNameAllocated(i, name_allocator);
+            FAISS_THROW_IF_NOT_MSG(
+                    std::strcmp(input_name.get(), input_names[i]) == 0 &&
+                            std::strcmp(output_name.get(), output_names[i]) == 0,
+                    "HNSW ONNX input/output names or order do not match the streaming contract");
+        }
 
         const std::vector<int64_t> features = tensor_shape(session, 0);
         const std::vector<int64_t> hidden = tensor_shape(session, 1);
-        const std::vector<int64_t> cell = tensor_shape(session, 2);
         require_shape(features, 3, "features");
         require_shape(hidden, 3, "hidden_in");
-        require_shape(cell, 3, "cell_in");
-        FAISS_THROW_IF_NOT_MSG(
-                hidden == cell,
-                "ONNX hidden_in and cell_in shapes must be identical");
+        if (has_cell) {
+            const std::vector<int64_t> cell = tensor_shape(session, 2);
+            require_shape(cell, 3, "cell_in");
+            FAISS_THROW_IF_NOT_MSG(
+                    hidden == cell,
+                    "ONNX hidden_in and cell_in shapes must be identical");
+        }
         FAISS_THROW_IF_NOT_MSG(
                 features[0] == 1 && hidden[1] == 1,
                 "HNSW ONNX inference currently requires batch size 1");
@@ -323,7 +338,7 @@ struct HNSWOnnxQuery::Impl {
                       static_cast<size_t>(model.num_layers) *
                               model.hidden_size,
                       0.0f),
-              cell(hidden.size(), 0.0f) {
+              cell(model.has_cell ? hidden.size() : 0, 0.0f) {
         if (model.provider == "cuda") {
 #ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
             check_cuda(cudaSetDevice(model.device_id), "cudaSetDevice");
@@ -337,10 +352,12 @@ struct HNSWOnnxQuery::Impl {
                         *gpu_allocator,
                         model.state_shape.data(),
                         model.state_shape.size()));
-                cell_gpu.emplace_back(Ort::Value::CreateTensor<float>(
-                        *gpu_allocator,
-                        model.state_shape.data(),
-                        model.state_shape.size()));
+                if (model.has_cell) {
+                    cell_gpu.emplace_back(Ort::Value::CreateTensor<float>(
+                            *gpu_allocator,
+                            model.state_shape.data(),
+                            model.state_shape.size()));
+                }
             }
 #ifdef FAISS_ENABLE_HNSW_CUDA_PIPELINE
             if (model.pipeline_depth) {
@@ -353,10 +370,12 @@ struct HNSWOnnxQuery::Impl {
                         hidden_gpu[0].GetTensorMutableData<float>(), 0,
                         hidden.size() * sizeof(float), model.pipeline_stream->stream),
                         "initialize hidden state");
-                check_cuda(cudaMemsetAsync(
-                        cell_gpu[0].GetTensorMutableData<float>(), 0,
-                        cell.size() * sizeof(float), model.pipeline_stream->stream),
-                        "initialize cell state");
+                if (model.has_cell) {
+                    check_cuda(cudaMemsetAsync(
+                            cell_gpu[0].GetTensorMutableData<float>(), 0,
+                            cell.size() * sizeof(float), model.pipeline_stream->stream),
+                            "initialize cell state");
+                }
                 has_gpu_state = true;
             }
 #endif
@@ -466,10 +485,14 @@ void HNSWOnnxQuery::submit_gpu(const float* features, size_t feature_count,
     auto& binding = slot.binding;
     binding.BindInput("features", slot.device_features);
     binding.BindInput("hidden_in", impl_->hidden_gpu[impl_->current_gpu_state]);
-    binding.BindInput("cell_in", impl_->cell_gpu[impl_->current_gpu_state]);
+    if (model.has_cell) {
+        binding.BindInput("cell_in", impl_->cell_gpu[impl_->current_gpu_state]);
+    }
     binding.BindOutput("probabilities", slot.device_probabilities);
     binding.BindOutput("hidden_out", impl_->hidden_gpu[next]);
-    binding.BindOutput("cell_out", impl_->cell_gpu[next]);
+    if (model.has_cell) {
+        binding.BindOutput("cell_out", impl_->cell_gpu[next]);
+    }
     Ort::RunOptions options;
     options.AddConfigEntry("disable_synchronize_execution_providers", "1");
     const auto prepared = profile ? Clock::now() : Clock::time_point{};
@@ -585,12 +608,15 @@ std::vector<float> HNSWOnnxQuery::predict(
                 impl_->hidden.size(),
                 model.state_shape.data(),
                 model.state_shape.size());
-        Ort::Value initial_cell = Ort::Value::CreateTensor<float>(
+        Ort::Value initial_cell{nullptr};
+        if (model.has_cell) {
+            initial_cell = Ort::Value::CreateTensor<float>(
                 model.memory_info,
                 impl_->cell.data(),
                 impl_->cell.size(),
                 model.state_shape.data(),
                 model.state_shape.size());
+        }
 
         const size_t next_state = impl_->has_gpu_state
                 ? 1 - impl_->current_gpu_state
@@ -602,14 +628,18 @@ std::vector<float> HNSWOnnxQuery::predict(
                 impl_->has_gpu_state
                         ? impl_->hidden_gpu[impl_->current_gpu_state]
                         : initial_hidden);
-        binding.BindInput(
+        if (model.has_cell) {
+            binding.BindInput(
                 "cell_in",
                 impl_->has_gpu_state
                         ? impl_->cell_gpu[impl_->current_gpu_state]
                         : initial_cell);
+        }
         binding.BindOutput("probabilities", probability_tensor);
         binding.BindOutput("hidden_out", impl_->hidden_gpu[next_state]);
-        binding.BindOutput("cell_out", impl_->cell_gpu[next_state]);
+        if (model.has_cell) {
+            binding.BindOutput("cell_out", impl_->cell_gpu[next_state]);
+        }
         model.session.Run(Ort::RunOptions{nullptr}, binding);
         binding.SynchronizeOutputs();
 
@@ -624,17 +654,19 @@ std::vector<float> HNSWOnnxQuery::predict(
             impl_->hidden.size(),
             model.state_shape.data(),
             model.state_shape.size());
-    Ort::Value cell_tensor = Ort::Value::CreateTensor<float>(
-            model.memory_info,
-            impl_->cell.data(),
-            impl_->cell.size(),
-            model.state_shape.data(),
-            model.state_shape.size());
-
     std::array<Ort::Value, 3> inputs = {
-            std::move(feature_tensor),
-            std::move(hidden_tensor),
-            std::move(cell_tensor)};
+            std::move(feature_tensor), std::move(hidden_tensor),
+            Ort::Value{nullptr}};
+    const size_t io_count = model.has_cell ? 3 : 2;
+    if (model.has_cell) {
+        inputs[2] = Ort::Value::CreateTensor<float>(
+                model.memory_info,
+                impl_->cell.data(),
+                impl_->cell.size(),
+                model.state_shape.data(),
+                model.state_shape.size());
+    }
+    /* The third input/output is used only by LSTM, not GRU. */
     constexpr std::array<const char*, 3> input_names = {
             "features", "hidden_in", "cell_in"};
     constexpr std::array<const char*, 3> output_names = {
@@ -644,9 +676,9 @@ std::vector<float> HNSWOnnxQuery::predict(
             Ort::RunOptions{nullptr},
             input_names.data(),
             inputs.data(),
-            inputs.size(),
+            io_count,
             output_names.data(),
-            output_names.size());
+            io_count);
     const auto run_ended = profile ? Clock::now() : Clock::time_point{};
 
     const size_t probability_count = outputs[0]
@@ -660,20 +692,23 @@ std::vector<float> HNSWOnnxQuery::predict(
             "ONNX probability output size does not match top-k");
     FAISS_THROW_IF_NOT_MSG(
             state_count == impl_->hidden.size() &&
-                    outputs[2]
+                    (!model.has_cell || outputs[2]
                                     .GetTensorTypeAndShapeInfo()
-                                    .GetElementCount() == state_count,
+                                    .GetElementCount() == state_count),
             "ONNX recurrent output state size mismatch");
 
     const float* probability_data = outputs[0].GetTensorData<float>();
     const float* hidden_data = outputs[1].GetTensorData<float>();
-    const float* cell_data = outputs[2].GetTensorData<float>();
+    const float* cell_data = model.has_cell
+            ? outputs[2].GetTensorData<float>() : nullptr;
     const auto metadata_ended = profile ? Clock::now() : Clock::time_point{};
     std::vector<float> probabilities(
             probability_data, probability_data + probability_count);
     const auto copy_ended = profile ? Clock::now() : Clock::time_point{};
     std::copy(hidden_data, hidden_data + state_count, impl_->hidden.begin());
-    std::copy(cell_data, cell_data + state_count, impl_->cell.begin());
+    if (model.has_cell) {
+        std::copy(cell_data, cell_data + state_count, impl_->cell.begin());
+    }
     if (profile) {
         const auto state_ended = Clock::now();
         const auto ms = [](auto begin, auto end) {

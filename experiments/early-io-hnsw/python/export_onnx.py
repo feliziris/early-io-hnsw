@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export trained HNSW LSTMs as stateful, one-timestep ONNX models."""
+"""Export trained HNSW LSTMs or GRUs as stateful, one-timestep ONNX models."""
 
 from __future__ import annotations
 
@@ -14,7 +14,7 @@ import onnxruntime as ort
 import torch
 from torch import nn
 
-from model import HnswLstm
+from model import HnswGru, HnswLstm
 from schema import FEATURE_COUNT, FEATURE_NAMES, query_group_name
 
 
@@ -48,6 +48,33 @@ class StreamingHnswLstm(nn.Module):
         )
         probabilities = torch.sigmoid(self.classifier(output[:, 0, :]))
         return probabilities, hidden_out, cell_out
+
+
+class StreamingHnswGru(nn.Module):
+    """One online GRU timestep with normalization and hidden state."""
+
+    def __init__(self, model: HnswGru, mean: np.ndarray, std: np.ndarray) -> None:
+        super().__init__()
+        self.gru = model.gru
+        self.classifier = model.classifier
+        self.k = model.k
+        self.register_buffer(
+            "feature_mean",
+            torch.as_tensor(mean, dtype=torch.float32).reshape(1, 1, FEATURE_COUNT),
+        )
+        self.register_buffer(
+            "feature_std",
+            torch.as_tensor(std, dtype=torch.float32).reshape(1, 1, FEATURE_COUNT),
+        )
+
+    def forward(
+        self, features: torch.Tensor, hidden_in: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        normalized = (features - self.feature_mean) / self.feature_std
+        timestep = normalized.reshape(features.shape[0], 1, self.k * FEATURE_COUNT)
+        output, hidden_out = self.gru(timestep, hidden_in)
+        probabilities = torch.sigmoid(self.classifier(output[:, 0, :]))
+        return probabilities, hidden_out
 
 
 def parse_args() -> argparse.Namespace:
@@ -88,10 +115,16 @@ def export_one(
     if tuple(checkpoint["feature_names"]) != FEATURE_NAMES:
         raise ValueError("checkpoint feature order does not match schema.py")
 
-    model = HnswLstm(**config)
+    model_name = checkpoint.get("model", "HnswLstm")
+    model_classes = {"HnswLstm": HnswLstm, "HnswGru": HnswGru}
+    if model_name not in model_classes:
+        raise ValueError(f"unsupported checkpoint model: {model_name!r}")
+    is_lstm = model_name == "HnswLstm"
+    model = model_classes[model_name](**config)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     model.eval()
-    streaming = StreamingHnswLstm(
+    streaming_class = StreamingHnswLstm if is_lstm else StreamingHnswGru
+    streaming = streaming_class(
         model, checkpoint["feature_mean"], checkpoint["feature_std"]
     ).eval()
 
@@ -100,13 +133,20 @@ def export_one(
     example_features = torch.zeros(1, topk, FEATURE_COUNT, dtype=torch.float32)
     example_hidden = torch.zeros(layers, 1, hidden_size, dtype=torch.float32)
     example_cell = torch.zeros_like(example_hidden)
+    example_states = (example_hidden, example_cell) if is_lstm else (example_hidden,)
+    input_names = ("features", "hidden_in", "cell_in") if is_lstm else (
+        "features", "hidden_in",
+    )
+    output_names = ("probabilities", "hidden_out", "cell_out") if is_lstm else (
+        "probabilities", "hidden_out",
+    )
     output_path = checkpoint_path.parent / "model.onnx"
     torch.onnx.export(
         streaming,
-        (example_features, example_hidden, example_cell),
+        (example_features, *example_states),
         output_path,
-        input_names=("features", "hidden_in", "cell_in"),
-        output_names=("probabilities", "hidden_out", "cell_out"),
+        input_names=input_names,
+        output_names=output_names,
         opset_version=opset,
         dynamo=False,
         do_constant_folding=True,
@@ -116,6 +156,7 @@ def export_one(
     onnx.checker.check_model(onnx_model)
     del onnx_model.metadata_props[:]
     metadata = {
+        "model_type": "lstm" if is_lstm else "gru",
         "topk": str(topk),
         "feature_count": str(FEATURE_COUNT),
         "feature_names": json.dumps(FEATURE_NAMES),
@@ -131,6 +172,8 @@ def export_one(
 
     raw_features = validation_features(data_path, validation_timesteps)
     timestep_count = raw_features.shape[0]
+    if timestep_count == 0:
+        raise ValueError("ONNX validation requires at least one non-final timestep")
     mean = torch.as_tensor(checkpoint["feature_mean"], dtype=torch.float32)
     std = torch.as_tensor(checkpoint["feature_std"], dtype=torch.float32)
     normalized = (
@@ -141,12 +184,11 @@ def export_one(
         full_probabilities = torch.sigmoid(
             model(normalized, torch.tensor([timestep_count]))
         ).numpy()[0]
-        hidden = example_hidden.clone()
-        cell = example_cell.clone()
+        states = tuple(state.clone() for state in example_states)
         step_probabilities = []
         for timestep in raw_features:
-            probability, hidden, cell = streaming(
-                torch.from_numpy(timestep).unsqueeze(0), hidden, cell
+            probability, *states = streaming(
+                torch.from_numpy(timestep).unsqueeze(0), *states
             )
             step_probabilities.append(probability.numpy()[0])
     step_probabilities_np = np.asarray(step_probabilities, dtype=np.float32)
@@ -160,18 +202,12 @@ def export_one(
     session = ort.InferenceSession(
         str(output_path), sess_options=options, providers=["CPUExecutionProvider"]
     )
-    hidden_np = np.zeros((layers, 1, hidden_size), dtype=np.float32)
-    cell_np = np.zeros_like(hidden_np)
+    states_np = [state.numpy().copy() for state in example_states]
     ort_probabilities = []
     for timestep in raw_features:
-        probability, hidden_np, cell_np = session.run(
-            ("probabilities", "hidden_out", "cell_out"),
-            {
-                "features": timestep[np.newaxis, ...],
-                "hidden_in": hidden_np,
-                "cell_in": cell_np,
-            },
-        )
+        feeds = dict(zip(input_names[1:], states_np))
+        feeds["features"] = timestep[np.newaxis, ...]
+        probability, *states_np = session.run(output_names, feeds)
         ort_probabilities.append(probability[0])
     ort_probabilities_np = np.asarray(ort_probabilities, dtype=np.float32)
     onnx_error = float(np.max(np.abs(ort_probabilities_np - step_probabilities_np)))

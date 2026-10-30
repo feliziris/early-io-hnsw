@@ -1,4 +1,4 @@
-# HNSW LSTM training
+# HNSW LSTM / GRU training
 
 This directory contains the new offline trainer. The previous experimental
 Python implementation is preserved under `tmp/`.
@@ -65,18 +65,46 @@ The Faiss runtime inference program will be kept separate from this offline
 trainer. It must use the feature order and normalization values saved in
 `best.pt`.
 
+## GRU model selection
+
+Use the same HDF5 traces, loss, and metrics with a two-layer GRU (hidden size 128):
+
+```bash
+python3 train.py \
+  --data /path/to/hnsw_trace.h5 \
+  --output /path/to/gru_io/k10 \
+  --model-type gru --num-layers 2 --hidden-size 128
+
+python3 inference.py --topk 10 \
+  --data /path/to/hnsw_trace.h5 --checkpoint /path/to/gru_io/k10/best.pt \
+  --raw-data /path/to/payload4k_10m.bin --payload-size 4096
+```
+
+`--model-type` defaults to `lstm`. Checkpoints store `HnswLstm` or `HnswGru`
+in the `model` field; inference and ONNX export select the class automatically.
+Older checkpoints without that field are treated as LSTM. GRU training requires
+new weights; existing LSTM checkpoints cannot be reused as GRU weights.
+
 ## Stateful ONNX export
 
-Export all three checkpoints as one-timestep streaming LSTMs:
+Export LSTM or GRU checkpoints as one-timestep streaming models:
 
 ```bash
 python3 export_onnx.py \
   --topk 10 20 50
 ```
 
-Each ONNX model accepts `features [1,k,6]`, `hidden_in [2,1,128]`, and
-`cell_in [2,1,128]`, and returns rank probabilities plus the next recurrent
-states. Feature normalization from `best.pt` is embedded in the graph. Models
+Use `--checkpoint-root /path/to/gru_io` to export GRU checkpoints from
+`k10/best.pt`, `k20/best.pt`, and `k50/best.pt`. The data root must contain
+`sift_query10000_k<K>.h5` validation files; specify it with `--data-root`.
+
+Both architectures accept `features [1,k,6]` and `hidden_in [layers,1,hidden_size]`,
+and return `probabilities [1,k]` and `hidden_out`. LSTM additionally accepts
+`cell_in` and returns `cell_out`, with the same shape as the hidden state.
+The Faiss ONNX runner detects this interface automatically; pass either model
+using the existing `--onnx-model` option. Layer count and hidden size come from
+the ONNX shapes. HDF5 is used for export validation, not Faiss runtime inference.
+Feature normalization from `best.pt` is embedded in the graph. Models
 and validation reports are written beside each checkpoint as `model.onnx` and
 `onnx_export.json`. Export validation compares full-sequence PyTorch,
 one-timestep PyTorch, and one-timestep ONNX Runtime outputs on a real test

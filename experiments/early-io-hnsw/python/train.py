@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train and test the HNSW LSTM using the embedded deterministic 80:20 split."""
+"""Train and test an HNSW LSTM or GRU using the embedded query split."""
 
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ from dataset import (
     fit_normalization,
     read_split,
 )
-from model import HnswLstm
+from model import HnswGru, HnswLstm
 from schema import FEATURE_NAMES
 
 
@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--learning-rate", type=float, default=3e-4)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--model-type", choices=("lstm", "gru"), default="lstm",
+                        help="recurrent model architecture (default: lstm)")
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=2)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -253,7 +255,7 @@ def run_epoch(
 def save_checkpoint(path, model, mean, std, epoch, metadata):
     temporary = path.with_suffix(path.suffix + ".tmp")
     torch.save({
-        "format_version": 1, "model": "HnswLstm",
+        "format_version": 1, "model": type(model).__name__,
         "model_config": model.config(), "state_dict": model.state_dict(),
         "feature_names": list(FEATURE_NAMES), "feature_mean": mean,
         "feature_std": std, "epoch": epoch,
@@ -294,7 +296,8 @@ def main() -> None:
     validation_loader = DataLoader(validation_data, shuffle=False, **loader_options)
     test_loader = DataLoader(test_data, shuffle=False, **loader_options)
 
-    model = HnswLstm(
+    model_class = {"lstm": HnswLstm, "gru": HnswGru}[args.model_type]
+    model = model_class(
         train_data.input_size, train_data.k, args.hidden_size,
         args.num_layers, args.dropout,
     ).to(device)
@@ -306,6 +309,7 @@ def main() -> None:
     )
     metadata = {
         "data": str(Path(args.data).resolve()), "seed": args.seed,
+        "model_type": args.model_type,
         "loss": "io_aware", "prefetch_threshold": args.prefetch_threshold,
         "min_prefetch_recall": args.min_prefetch_recall,
         "selection_rule": (
@@ -317,7 +321,8 @@ def main() -> None:
         "train_positive_labels": positives, "train_negative_labels": negatives,
     }
     print(
-        f"device={device} k={train_data.k} input_size={train_data.input_size} "
+        f"model_type={args.model_type} device={device} "
+        f"k={train_data.k} input_size={train_data.input_size} "
         f"train={len(train_ids)} validation={len(validation_ids)} "
         f"test={len(test_ids)} loss=io_aware "
         f"min_prefetch_recall={args.min_prefetch_recall:.3f}",

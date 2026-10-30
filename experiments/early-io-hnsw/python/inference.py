@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run an HNSW LSTM checkpoint on the embedded HDF5 test split.
+"""Run an HNSW LSTM or GRU checkpoint on the embedded HDF5 test split.
 
 Each node can trigger at most one prefetch decision per query.  Metrics are
 written as JSON so that the exact counts behind the two requested aggregate
@@ -22,13 +22,13 @@ import torch
 from torch.utils.data import DataLoader
 
 from dataset import HnswSequenceDataset, collate_sequences, read_split
-from model import HnswLstm
+from model import HnswGru, HnswLstm
 from schema import FEATURE_COUNT, FEATURE_NAMES
 
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate a trained HNSW LSTM on the HDF5 test split."
+        description="Evaluate a trained HNSW LSTM or GRU on the HDF5 test split."
     )
     parser.add_argument(
         "--topk",
@@ -143,7 +143,11 @@ def load_checkpoint(path: Path, device: torch.device):
         raise ValueError("checkpoint normalization contains invalid values")
 
     config = checkpoint["model_config"]
-    model = HnswLstm(**config).to(device)
+    model_name = checkpoint.get("model", "HnswLstm")
+    model_classes = {"HnswLstm": HnswLstm, "HnswGru": HnswGru}
+    if model_name not in model_classes:
+        raise ValueError(f"unsupported checkpoint model: {model_name!r}")
+    model = model_classes[model_name](**config).to(device)
     model.load_state_dict(checkpoint["state_dict"], strict=True)
     model.eval()
     return checkpoint, model, mean, std
@@ -433,7 +437,7 @@ def update_metrics(
 
 
 def infer(
-    model: HnswLstm,
+    model: HnswLstm | HnswGru,
     loader: DataLoader,
     device: torch.device,
     threshold: float,
@@ -596,6 +600,7 @@ def main() -> None:
     result = {
         "checkpoint": str(checkpoint_path),
         "checkpoint_epoch": int(checkpoint.get("epoch", -1)),
+        "model": type(model).__name__,
         "data": str(data_path),
         "device": str(device),
         "elapsed_seconds": elapsed_seconds,

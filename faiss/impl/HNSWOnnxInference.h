@@ -16,7 +16,7 @@ namespace faiss {
 
 struct HNSWOnnxPredictProfile;
 
-/** One-query recurrent state for a streaming HNSW LSTM model. */
+/** One-query recurrent state for a streaming HNSW LSTM or GRU model. */
 class HNSWOnnxQuery {
    public:
     ~HNSWOnnxQuery();
@@ -57,7 +57,10 @@ class HNSWOnnxModel {
    public:
     struct Impl;
 
-    /** provider is "cpu" or "cuda" ("gpu" is accepted as a CUDA alias). */
+    /** provider is "cpu" or "cuda" ("gpu" is accepted as a CUDA alias).
+     * Streaming models use features/hidden_in -> probabilities/hidden_out.
+     * LSTM also uses cell_in/cell_out; the interface is detected at load time.
+     */
     explicit HNSWOnnxModel(
             const std::string& model_path,
             const std::string& provider = "cpu",
