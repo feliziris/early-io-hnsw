@@ -1641,6 +1641,7 @@ int search_from_candidates_fixVT(
     HNSWSearchProfile* profile =
             profile_params ? profile_params->search_profile : nullptr;
 
+    const int64_t initial_graph_started = profile ? profile_now_ns() : 0;
     vt.reserve(efSearch);
 
     typename C::T threshold = res.threshold;
@@ -1657,6 +1658,10 @@ int search_from_candidates_fixVT(
         }
         vt.set(v1);
     }
+    if (profile) {
+        profile->graph_traversal_ms +=
+                (profile_now_ns() - initial_graph_started) / 1e6;
+    }
 
     int nstep = 0;
     std::vector<int32_t> previous_rank_ids;
@@ -1671,6 +1676,7 @@ int search_from_candidates_fixVT(
     }
 
     while (candidates.size() > 0) {
+        const int64_t graph_step_started = profile ? profile_now_ns() : 0;
         float d0 = 0;
         int v0 = candidates.pop_min(&d0);
 
@@ -1681,6 +1687,10 @@ int search_from_candidates_fixVT(
 
             int n_dis_below = candidates.count_below(d0);
             if (n_dis_below >= efSearch) {
+                if (profile) {
+                    profile->graph_traversal_ms +=
+                            (profile_now_ns() - graph_step_started) / 1e6;
+                }
                 break;
             }
         }
@@ -1754,6 +1764,10 @@ int search_from_candidates_fixVT(
         }
 
         nstep++;
+        if (profile) {
+            profile->graph_traversal_ms +=
+                    (profile_now_ns() - graph_step_started) / 1e6;
+        }
         if (feature_trace) {
             const int64_t feature_started = profile ? profile_now_ns() : 0;
             collect_feature_timestep<C>(
@@ -2385,7 +2399,9 @@ HNSWStats search_impl(
     }
     std::unique_ptr<HNSWRawDataQuery> raw_data_query;
     if (profile) {
+        const bool lightweight_search = profile->lightweight_search;
         *profile = HNSWSearchProfile{};
+        profile->lightweight_search = lightweight_search;
         profile->start_ns = profile_now_ns();
     }
     if (raw_data_prefetcher) {
@@ -2394,6 +2410,7 @@ HNSWStats search_impl(
     }
 
     //  greedy search on upper levels
+    const int64_t upper_graph_started = profile ? profile_now_ns() : 0;
     storage_idx_t nearest = hnsw.entry_point;
     float d_nearest = qdis(nearest);
 
@@ -2404,6 +2421,8 @@ HNSWStats search_impl(
     }
 
     if (profile) {
+        profile->graph_traversal_ms +=
+                (profile_now_ns() - upper_graph_started) / 1e6;
         profile->upper_end_ms = profile_elapsed_ms(profile);
     }
     HNSWQueryTrace onnx_only_trace;
@@ -2444,7 +2463,7 @@ HNSWStats search_impl(
                     std::move(onnx_query),
                     onnx_threshold,
                     raw_data_query.get(),
-                    profile);
+                    profile && !profile->lightweight_search ? profile : nullptr);
         }
     }
 

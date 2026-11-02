@@ -33,6 +33,8 @@ struct HNSWInferenceProfileEvent {
 };
 
 struct HNSWSearchProfile {
+    // Lightweight search-phase accounting skips inference-thread event tracing.
+    bool lightweight_search = false;
     int64_t start_ns = 0;
     double upper_end_ms = 0;
     double setup_end_ms = 0;
@@ -43,6 +45,8 @@ struct HNSWSearchProfile {
     double requests_submitted_ms = 0;
     double data_ready_ms = 0;
     double feature_ms = 0;
+    // Upper-layer greedy search + level-0 queue/neighbor/distance work only.
+    double graph_traversal_ms = 0;
     double enqueue_ms = 0;
     double predict_ms = 0;
     double io_submit_ms = 0;

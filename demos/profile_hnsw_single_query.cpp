@@ -15,10 +15,14 @@
 #include <vector>
 
 int main(int argc, char** argv) {
+    // Keep the workload/warmup identical; only toggle detailed instrumentation.
+    const bool profiling_enabled =
+            argc < 2 || std::string(argv[argc - 1]) != "--no-profile";
+    if (!profiling_enabled) --argc;
     if (argc < 7 || argc > 10) {
         std::cerr << "usage: profile_hnsw_single_query INDEX QUERY.fvecs SIDECAR "
                      "MODEL.onnx RAW_PAYLOAD OUTPUT.json [query-row=0] "
-                     "[provider=cpu] [gpu-inflight=8]\n";
+                     "[provider=cpu] [gpu-inflight=8] [--no-profile]\n";
         return 2;
     }
     try {
@@ -67,7 +71,7 @@ int main(int argc, char** argv) {
         params.raw_data_prefetcher = &raw;
         params.prefetch_enabled = true;
         params.onnx_async_inference = true;
-        params.search_profile = &profile;
+        params.search_profile = profiling_enabled ? &profile : nullptr;
         const auto measured_started = std::chrono::steady_clock::now();
         index->search(1, query.data(), k, distances.data(), labels.data(), &params);
         const double search_call_ms = std::chrono::duration<double, std::milli>(
@@ -97,10 +101,12 @@ int main(int argc, char** argv) {
                         reference.timesteps[t].prediction_probabilities[r]));
             }
         }
-        if (profile.inference_events.size() != predicted_timesteps || max_error > 1e-4f) {
+        if ((profiling_enabled && profile.inference_events.size() != predicted_timesteps) ||
+            max_error > 1e-4f) {
             throw std::runtime_error("profile inference validation failed");
         }
-        if (std::abs(profile.data_ready_ms - summary.end_to_end_latency.mean_us / 1000) > 1e-6) {
+        if (profiling_enabled &&
+            std::abs(profile.data_ready_ms - summary.end_to_end_latency.mean_us / 1000) > 1e-6) {
             throw std::runtime_error("profile and raw-data timing boundaries differ");
         }
 
@@ -118,13 +124,35 @@ int main(int argc, char** argv) {
             << ",\n  \"io_workers\": 4,\n"
             << "  \"payload_bytes\": 4096,\n  \"evict_file_cache_advised\": true,\n"
             << "  \"worker_startup_excluded\": true,\n  \"untimed_provider_warmup\": true,\n"
-            << "  \"profiling_enabled\": true,\n  \"timesteps\": " << trace.timesteps.size()
+            << "  \"profiling_enabled\": " << (profiling_enabled ? "true" : "false")
+            << ",\n  \"timesteps\": " << trace.timesteps.size()
             << ",\n  \"prediction_policy\": \"stop_at_graph_end\""
             << ",\n  \"search_call_ms\": " << search_call_ms
             << ",\n  \"prediction_timesteps\": " << predicted_timesteps
-            << ",\n  \"prediction_cleanup_after_data_ready_ms\": "
+            << ",\n  \"end_to_end_ms\": " << summary.end_to_end_latency.mean_us / 1000
+            << ",\n  \"search_ms\": " << summary.search_latency.mean_us / 1000
+            << ",\n  \"data_ready_wait_ms\": " << summary.data_ready_wait_latency.mean_us / 1000;
+        if (!profiling_enabled) {
+            // Do not emit zero-filled phase/event data as if it were measured.
+            out << ",\n  \"tp\": " << summary.prefetch_tp
+                << ",\n  \"fp\": " << summary.prefetch_fp
+                << ",\n  \"fn\": " << summary.prefetch_fn
+                << ",\n  \"read_count\": " << summary.async_read_count
+                << ",\n  \"post_search_drain_ms\": " << drain_ms
+                << ",\n  \"max_probability_error_vs_sync\": " << max_error
+                << "\n}\n";
+            if (!out) throw std::runtime_error("failed writing summary JSON");
+            std::cout << "profile=" << argv[6]
+                      << "\nprofiling_enabled=false"
+                      << "\nsearch_ms=" << summary.search_latency.mean_us / 1000
+                      << "\ndata_ready_wait_ms=" << summary.data_ready_wait_latency.mean_us / 1000
+                      << "\nend_to_end_ms=" << summary.end_to_end_latency.mean_us / 1000
+                      << "\ntimesteps=" << trace.timesteps.size()
+                      << "\nvalidation_passed=true\n";
+            return 0;
+        }
+        out << ",\n  \"prediction_cleanup_after_data_ready_ms\": "
             << std::max(0.0, profile.inference_end_ms - profile.data_ready_ms)
-            << ",\n  \"end_to_end_ms\": " << profile.data_ready_ms
             << ",\n  \"phases_ms\": {\n"
             << "    \"upper_levels\": " << profile.upper_end_ms
             << ",\n    \"query_setup\": " << profile.setup_end_ms - profile.upper_end_ms
@@ -178,6 +206,9 @@ int main(int argc, char** argv) {
         out << "\n  ]\n}\n";
         if (!out) throw std::runtime_error("failed writing profile JSON");
         std::cout << "profile=" << argv[6] << "\nend_to_end_ms=" << profile.data_ready_ms
+                  << "\nprofiling_enabled=true"
+                  << "\nsearch_ms=" << summary.search_latency.mean_us / 1000
+                  << "\ndata_ready_wait_ms=" << summary.data_ready_wait_latency.mean_us / 1000
                   << "\ntimesteps=" << trace.timesteps.size()
                   << "\nvalidation_passed=true\n";
     } catch (const std::exception& error) {

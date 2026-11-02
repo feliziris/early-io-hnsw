@@ -10,6 +10,7 @@
 #include <faiss/index_io.h>
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdint>
 #include <cstring>
@@ -367,6 +368,7 @@ int main(int argc, char** argv) {
                    "--payload-size BYTES --io-workers N "
                    "--io-queue-size N [--evict-file-cache] "
                    "[--warmup-search] [--oracle-prefetch] "
+                   "[--search-breakdown CSV] "
                    "[--prefetch-record-out FILE] "
                    "[--prefetch-replay-in FILE]]\n";
         return 2;
@@ -404,6 +406,7 @@ int main(int argc, char** argv) {
         bool evict_file_cache = false;
         bool oracle_prefetch = false;
         bool warmup_search = false;
+        std::string search_breakdown_path;
         std::string prefetch_record_path;
         std::string prefetch_replay_path;
         for (int argument = 8; argument < argc;) {
@@ -425,7 +428,9 @@ int main(int argc, char** argv) {
             if (argument >= argc) {
                 throw std::runtime_error(option + " requires a value");
             }
-            if (option == "--avg-neighbor-distance") {
+            if (option == "--search-breakdown") {
+                search_breakdown_path = argv[argument++];
+            } else if (option == "--avg-neighbor-distance") {
                 avg_neighbor_distance_path = argv[argument++];
             } else if (option == "--prefetch-record-out") {
                 prefetch_record_path = argv[argument++];
@@ -501,6 +506,17 @@ int main(int argc, char** argv) {
                     "--onnx-inference async requires --onnx-model");
         }
         const bool raw_io_enabled = !raw_data_path.empty();
+        // A payload baseline runs ordinary HNSW without per-step feature work.
+        // Offline label generation (no raw I/O) still collects complete traces.
+        const bool feature_collection_enabled =
+                !(raw_io_enabled && prefetch_mode == "off");
+        if (!search_breakdown_path.empty() &&
+            (!raw_io_enabled || batch_size != 1 ||
+             (onnx_enabled && onnx_inference != "async"))) {
+            throw std::runtime_error(
+                    "--search-breakdown requires raw I/O, batch-size 1, "
+                    "and async inference when using a model");
+        }
         if (raw_io_enabled != !prefetch_mode.empty()) {
             throw std::runtime_error(
                     "--raw-data and --prefetch must be specified together");
@@ -578,7 +594,9 @@ int main(int argc, char** argv) {
         }
 
         const auto feature_started = std::chrono::steady_clock::now();
-        if (avg_neighbor_distance_path.empty()) {
+        if (!feature_collection_enabled) {
+            // Baseline does not use the precomputed feature cache either.
+        } else if (avg_neighbor_distance_path.empty()) {
             hnsw_index->compute_level0_avg_neighbor_distance();
         } else {
             hnsw_index->read_level0_avg_neighbor_distance(
@@ -666,7 +684,20 @@ int main(int argc, char** argv) {
             params.prefetch_enabled = prefetch_mode == "on";
         }
         faiss::HNSWFeatureCollector collector;
-        params.feature_collector = &collector;
+        params.feature_collector = feature_collection_enabled ? &collector : nullptr;
+
+        std::ofstream breakdown_output;
+        double graph_total_ms = 0, feature_total_ms = 0, other_total_ms = 0;
+        double enqueue_total_ms = 0;
+        if (!search_breakdown_path.empty()) {
+            breakdown_output.open(search_breakdown_path);
+            if (!breakdown_output) {
+                throw std::runtime_error("cannot open search breakdown CSV");
+            }
+            breakdown_output << std::fixed << std::setprecision(9)
+                    << "query_id,graph_ms,feature_ms,snapshot_and_other_ms,"
+                       "enqueue_ms,search_ms,io_wait_ms,e2e_ms\n";
+        }
 
         const auto search_started = std::chrono::steady_clock::now();
         std::uint64_t prediction_timesteps = 0;
@@ -693,6 +724,11 @@ int main(int argc, char** argv) {
                 params.prefetch_replay_query_count = count;
             }
 
+            faiss::HNSWSearchProfile search_profile;
+            if (!search_breakdown_path.empty()) {
+                search_profile.lightweight_search = true;
+                params.search_profile = &search_profile;
+            }
             index->search(
                     count,
                     queries.vectors.data() +
@@ -702,13 +738,48 @@ int main(int argc, char** argv) {
                     distances.data(),
                     labels.data(),
                     &params);
-            if (collector.queries.size() != count) {
+            if (!search_breakdown_path.empty()) {
+                // Exclusive search-thread partition. The residual includes
+                // snapshot enqueue, query setup, cancellation and final-result
+                // handling; it excludes raw-data wait and inference cleanup.
+                const double other_ms = search_profile.search_end_ms -
+                        search_profile.graph_traversal_ms - search_profile.feature_ms;
+                if (!std::isfinite(other_ms) || other_ms < 0) {
+                    throw std::runtime_error("invalid search phase partition");
+                }
+                graph_total_ms += search_profile.graph_traversal_ms;
+                feature_total_ms += search_profile.feature_ms;
+                other_total_ms += other_ms;
+                enqueue_total_ms += search_profile.enqueue_ms;
+                breakdown_output << first << ','
+                        << search_profile.graph_traversal_ms << ','
+                        << search_profile.feature_ms << ',' << other_ms << ','
+                        << search_profile.enqueue_ms << ','
+                        << search_profile.search_end_ms << ','
+                        << search_profile.data_ready_ms - search_profile.search_end_ms << ','
+                        << search_profile.data_ready_ms << '\n';
+                params.search_profile = nullptr;
+            }
+            if (feature_collection_enabled && collector.queries.size() != count) {
                 throw std::runtime_error("collector batch size mismatch");
             }
 
             for (std::uint32_t local = 0; local < count; ++local) {
                 const std::uint32_t query_id = first + local;
-                const faiss::HNSWQueryTrace& trace = collector.queries[local];
+                // Save only final IDs/distances for a baseline, outside search
+                // timing. No feature snapshots or timestep labels are created.
+                faiss::HNSWQueryTrace final_only_trace;
+                if (!feature_collection_enabled) {
+                    final_only_trace.k = k;
+                    final_only_trace.ef_search = ef_search;
+                    const size_t offset = static_cast<size_t>(local) * k;
+                    for (size_t rank = 0; rank < k; ++rank) {
+                        final_only_trace.final_top_k_ids.push_back(labels[offset + rank]);
+                        final_only_trace.final_top_k_distances.push_back(distances[offset + rank]);
+                    }
+                }
+                const faiss::HNSWQueryTrace& trace = feature_collection_enabled
+                        ? collector.queries[local] : final_only_trace;
                 gpu_pipeline_submitted += trace.gpu_pipeline_submitted;
                 gpu_pipeline_peak_inflight = std::max(
                         gpu_pipeline_peak_inflight, trace.gpu_pipeline_peak_inflight);
@@ -821,9 +892,10 @@ int main(int argc, char** argv) {
                   << "avg_neighbor_distance_seconds=" << feature_seconds
                   << '\n'
                   << "avg_neighbor_distance_source="
-                  << (avg_neighbor_distance_path.empty() ? "computed"
-                                                         : "loaded")
+                  << (!feature_collection_enabled ? "disabled" :
+                      (avg_neighbor_distance_path.empty() ? "computed" : "loaded"))
                   << '\n'
+                  << "feature_collection_enabled=" << feature_collection_enabled << '\n'
                   << "search_and_write_seconds=" << search_seconds << '\n'
                   << "timesteps=" << total_stats.timesteps << '\n'
                   << "labels=" << total_stats.labels << '\n'
@@ -881,6 +953,14 @@ int main(int argc, char** argv) {
                       << "raw_total_bytes_read=" << raw.total_bytes_read
                       << '\n';
             print_latency("raw_search", raw.search_latency);
+            if (!search_breakdown_path.empty()) {
+                std::cout << "search_breakdown_count=" << queries.count << '\n'
+                          << "graph_traversal_mean_ms=" << graph_total_ms / queries.count << '\n'
+                          << "feature_collection_mean_ms=" << feature_total_ms / queries.count << '\n'
+                          << "snapshot_and_other_mean_ms=" << other_total_ms / queries.count << '\n'
+                          << "snapshot_enqueue_mean_ms=" << enqueue_total_ms / queries.count << '\n'
+                          << "search_breakdown_path=" << search_breakdown_path << '\n';
+            }
             print_latency(
                     "raw_data_ready_wait", raw.data_ready_wait_latency);
             print_latency("raw_end_to_end", raw.end_to_end_latency);

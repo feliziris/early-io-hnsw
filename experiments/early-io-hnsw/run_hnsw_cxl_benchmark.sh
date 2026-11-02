@@ -18,7 +18,7 @@ generator="${GENERATOR_PATH:-${repo_root}/build-onnx-cpu/demos/generate_sift_que
 index="${INDEX_PATH:-${repo_root}/data/index/bigann_base10M_hnsw_M32_efC128.faiss}"
 queries="${QUERY_PATH:-${repo_root}/output/sift10M/bigann_query_test1000_seed42.fvecs}"
 sidecar="${AVG_NEIGHBOR_DISTANCE_PATH:-${repo_root}/data/index/bigann_base10M_hnsw_M32_efC128.level0_avg_neighbor_distance.bin}"
-model="${ONNX_MODEL_PATH:-${repo_root}/model/sift10M/lstm_io/ef200/k${topk}/model.onnx}"
+model="${ONNX_MODEL_PATH:-${repo_root}/model/sift10M/ef200/lstm_io/k${topk}/model.onnx}"
 raw_data="${RAW_DATA_PATH:-${repo_root}/workspace/raw_data/payload4k_10m.bin}"
 result_root="${RESULT_ROOT:-${repo_root}/workspace/results}"
 memory_node="${MEMORY_NODE:-2}"
@@ -33,7 +33,7 @@ export OMP_NUM_THREADS="${OMP_NUM_THREADS:-1}"
 export OPENBLAS_NUM_THREADS="${OPENBLAS_NUM_THREADS:-1}"
 
 for mode in baseline prefetch; do
-    result_dir="${result_root}/k${topk}_${mode}_cxl_cpu${cpu}"
+    result_dir="${result_root}/k${topk}_${mode}"
     mkdir -p -- "${result_dir}"
     command=(numactl --cpunodebind "${cpu}" --membind "${memory_node}"
         "${generator}" "${index}" "${queries}"
