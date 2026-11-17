@@ -55,6 +55,35 @@ queue is excluded. This avoids repeated computation of overlapping prefixes.
 The loss is the original `io_aware` weighted BCE: positive labels have weight
 1, while negative labels have weight `1 + search_progress`.
 
+### Weighted BCE + TP Decision Delay
+
+Select the additional loss with `--loss io_aware_delay`:
+
+```bash
+python3 train.py --data /path/to/hnsw_trace.h5 --output /path/to/delay_model \
+  --loss io_aware_delay --delay-loss-weight 1.0 --prefetch-threshold 0.5
+```
+
+The new mode averages BCE over valid top-k slots, then over valid timesteps
+within each query, then over queries. The default `--loss io_aware` retains
+the previous slot-sum / valid-batch-timestep reduction. Consequently the BCE
+scales of these two modes differ. Both use the stored
+`search_progress = pop_count / efSearch` and negative weight `1 + search_progress`.
+
+For each final top-k node, the delay term tracks its maximum predicted
+probability since first entry, by node ID even when its rank changes. Each
+valid timestep from first entry contributes `relu(theta - running_max) / theta`.
+The per-query sum is divided by `k*T` and averaged across queries. Non-final
+nodes, pre-entry times, invalid node slots and padded timesteps are excluded.
+The existing final-timestep exclusion remains in effect.
+
+The total is `BCE + delay_loss_weight * delay`; `theta` is the fixed
+`--prefetch-threshold` and must be greater than zero. Neither theta nor the
+loss weight is learned. The history and validation/test metrics report
+`bce_loss` and unweighted `delay_loss` separately. Checkpoints record the loss
+choice, its weight and threshold. Model selection continues using the existing
+validation recall constraint, wasted I/O and TP decision delay.
+
 The complete reproducible generation, conversion and training pipeline is:
 
 ```bash

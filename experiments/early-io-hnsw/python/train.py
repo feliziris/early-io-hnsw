@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -24,6 +25,7 @@ from dataset import (
     read_split,
 )
 from model import HnswGru, HnswLstm
+from losses import weighted_bce_with_tp_delay
 from schema import FEATURE_NAMES
 
 
@@ -48,6 +50,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="auto")
     parser.add_argument("--prefetch-threshold", type=float, default=0.5,
                         help="first score at or above this value triggers one prefetch per node")
+    parser.add_argument("--loss", choices=("io_aware", "io_aware_delay"), default="io_aware",
+                        help="legacy I/O-aware BCE or query-normalized BCE plus TP delay")
+    parser.add_argument("--delay-loss-weight", type=float, default=1.0,
+                        help="lambda_D for io_aware_delay (default: 1)")
     parser.add_argument("--min-prefetch-recall", type=float, default=0.95,
                         help="minimum validation unique-prefetch recall for best-model selection")
     return parser.parse_args()
@@ -206,11 +212,12 @@ def checkpoint_selection_key(metrics, min_prefetch_recall):
 
 def run_epoch(
     model, loader, device, optimizer=None, collect_metrics=False,
-    prefetch_threshold=0.5,
+    prefetch_threshold=0.5, loss_type="io_aware", delay_loss_weight=1.0,
 ):
     training = optimizer is not None
     model.train(training)
     loss_sum = 0.0
+    bce_sum = delay_sum = 0.0
     query_count = 0
     all_logits, all_labels = [], []
     prefetch_accumulator = new_prefetch_accumulator() if collect_metrics else None
@@ -223,13 +230,25 @@ def run_epoch(
             optimizer.zero_grad(set_to_none=True)
         with torch.set_grad_enabled(training):
             logits = model(features, lengths)
-            loss = io_aware_loss(logits, labels, search_progress, lengths)
+            if loss_type == "io_aware":
+                loss = io_aware_loss(logits, labels, search_progress, lengths)
+            elif loss_type == "io_aware_delay":
+                loss, bce, delay = weighted_bce_with_tp_delay(
+                    logits, labels, search_progress, node_ids.to(device),
+                    final_ids.to(device), lengths, threshold=prefetch_threshold,
+                    delay_weight=delay_loss_weight,
+                )
+            else:
+                raise ValueError(f"Unknown loss: {loss_type}")
             if training:
                 loss.backward()
                 clip_grad_norm_(model.parameters(), 1.0)
                 optimizer.step()
         batch_size = features.shape[0]
         loss_sum += float(loss.detach()) * batch_size
+        if loss_type == "io_aware_delay":
+            bce_sum += float(bce.detach()) * batch_size
+            delay_sum += float(delay.detach()) * batch_size
         query_count += batch_size
         if collect_metrics:
             valid_logits, valid_labels = collect_valid(logits, labels, lengths)
@@ -244,6 +263,9 @@ def run_epoch(
                 prefetch_threshold,
             )
     result = {"loss": loss_sum / max(query_count, 1)}
+    if loss_type == "io_aware_delay":
+        result.update(bce_loss=bce_sum / max(query_count, 1),
+                      delay_loss=delay_sum / max(query_count, 1))
     if collect_metrics:
         result.update(metrics_from_arrays(
             torch.cat(all_logits).numpy(), torch.cat(all_labels).numpy()
@@ -259,7 +281,7 @@ def save_checkpoint(path, model, mean, std, epoch, metadata):
         "model_config": model.config(), "state_dict": model.state_dict(),
         "feature_names": list(FEATURE_NAMES), "feature_mean": mean,
         "feature_std": std, "epoch": epoch,
-        "loss": "io_aware", "metadata": metadata,
+        "loss": metadata.get("loss", "io_aware"), "metadata": metadata,
     }, temporary)
     os.replace(temporary, path)
 
@@ -272,6 +294,10 @@ def main() -> None:
         raise ValueError("prefetch-threshold must be between 0 and 1")
     if not 0.0 <= args.min_prefetch_recall <= 1.0:
         raise ValueError("min-prefetch-recall must be between 0 and 1")
+    if not math.isfinite(args.delay_loss_weight) or args.delay_loss_weight < 0:
+        raise ValueError("delay-loss-weight must be finite and non-negative")
+    if args.loss == "io_aware_delay" and args.prefetch_threshold <= 0:
+        raise ValueError("io_aware_delay requires prefetch-threshold > 0")
     seed_everything(args.seed)
     device = select_device(args.device)
     output = Path(args.output)
@@ -310,7 +336,11 @@ def main() -> None:
     metadata = {
         "data": str(Path(args.data).resolve()), "seed": args.seed,
         "model_type": args.model_type,
-        "loss": "io_aware", "prefetch_threshold": args.prefetch_threshold,
+        "loss": args.loss, "prefetch_threshold": args.prefetch_threshold,
+        "delay_loss_weight": args.delay_loss_weight,
+        "bce_reduction": ("per_query_mean_of_timestep_slot_means"
+                          if args.loss == "io_aware_delay" else "slot_sum_over_valid_batch_timesteps"),
+        "search_progress_definition": "stored pop_count / efSearch",
         "min_prefetch_recall": args.min_prefetch_recall,
         "selection_rule": (
             "recall_constraint_then_min_wasted_io_then_min_tp_decision_delay"
@@ -324,7 +354,7 @@ def main() -> None:
         f"model_type={args.model_type} device={device} "
         f"k={train_data.k} input_size={train_data.input_size} "
         f"train={len(train_ids)} validation={len(validation_ids)} "
-        f"test={len(test_ids)} loss=io_aware "
+        f"test={len(test_ids)} loss={args.loss} "
         f"min_prefetch_recall={args.min_prefetch_recall:.3f}",
         flush=True,
     )
@@ -333,18 +363,22 @@ def main() -> None:
     best_selection_key = None
     best_validation = None
     best_epoch = 0
+    loss_options = dict(loss_type=args.loss, delay_loss_weight=args.delay_loss_weight,
+                        prefetch_threshold=args.prefetch_threshold)
     for epoch in range(1, args.epochs + 1):
         train_result = run_epoch(
             model, train_loader, device, optimizer=optimizer,
             collect_metrics=False,
+            **loss_options,
         )
         validation_result = run_epoch(
             model, validation_loader, device, collect_metrics=True,
-            prefetch_threshold=args.prefetch_threshold,
+            **loss_options,
         )
         scheduler.step()
         record = {
             "epoch": epoch, "train_loss": train_result["loss"],
+            "train": train_result,
             "validation": validation_result,
             "learning_rate": optimizer.param_groups[0]["lr"],
         }
@@ -380,7 +414,7 @@ def main() -> None:
     model.load_state_dict(best_checkpoint["state_dict"])
     test_result = run_epoch(
         model, test_loader, device, collect_metrics=True,
-        prefetch_threshold=args.prefetch_threshold,
+        **loss_options,
     )
     print(
         f"best_epoch={best_epoch} "
@@ -400,7 +434,7 @@ def main() -> None:
             "arguments": vars(args), "metadata": metadata,
             "feature_names": list(FEATURE_NAMES),
             "feature_mean": mean.tolist(), "feature_std": std.tolist(),
-            "loss": "io_aware", "history": history,
+            "loss": args.loss, "history": history,
             "best_epoch": best_epoch,
             "best_validation": best_validation,
             "selection_rule": metadata["selection_rule"],
